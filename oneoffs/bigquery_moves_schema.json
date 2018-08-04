@@ -10,6 +10,11 @@
         "mode": "REQUIRED"
     },
     {
+        "name": "model_num",
+        "type": "INTEGER",
+        "mode": "NULLABLE"
+    },
+    {
         "name": "move_num",
         "type": "INTEGER",
         "mode": "NULLABLE"
@@ -30,11 +35,6 @@
         "mode": "NULLABLE"
     },
     {
-        "name": "prior_Q",
-        "type": "FLOAT",
-        "mode": "NULLABLE"
-    },
-    {
         "name": "post_Q",
         "type": "FLOAT",
         "mode": "NULLABLE"
@@ -42,21 +42,21 @@
     {
         "name": "policy_prior",
         "type": "FLOAT",
-        "mode": "REPEATED"
+        "mode": "NULLABLE"
     },
     {
         "name": "policy_prior_orig",
         "type": "FLOAT",
-        "mode": "REPEATED"
+        "mode": "NULLABLE"
     },
     {
         "name": "mcts_visit_counts",
         "type": "FLOAT",
-        "mode": "REPEATED"
+        "mode": "NULLABLE"
     },
     {
         "name": "mcts_visit_counts_norm",
         "type": "FLOAT",
-        "mode": "REPEATED"
+        "mode": "NULLABLE"
     }
 ]

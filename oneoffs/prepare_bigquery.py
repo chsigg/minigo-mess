@@ -1,23 +1,31 @@
 '''
 Script to process debug SGFs for upload to BigQuery.
 
-Handles one model per invocation, for easy sharding of work.
+Handles one directory per invocation, for easy sharding of work.
 
 Usage:
-python oneoffs/prepare_bigquery.py 000001-model-name
+BOARD_SIZE=19 python oneoffs/prepare_bigquery.py \
+    --sgf_dir=gs://$BUCKET_NAME/sgf/full/2018-07-20-00/
+    --output_dir=gs://$BUCKET_NAME/bigquery/
 
 
 The load commands look like:
+
+export PROJECT_ID=blah
+export DATASET_ID=minigo_v9_19
+
+bq mk --project_id=$PROJECT_ID $DATASET_ID
+
 bq load --project_id=$PROJECT_ID \
     --source_format=NEWLINE_DELIMITED_JSON \
-    $PROJECT_ID:minigo_v5_19.games \
-    gs://$BUCKET_NAME/bigquery/holdout/games/* \
+    $PROJECT_ID:$DATASET_ID.games \
+    gs://$BUCKET_NAME/bigquery/games/* \
     oneoffs/bigquery_games_schema.json
 
 bq load --project_id=$PROJECT_ID \
     --source_format=NEWLINE_DELIMITED_JSON \
-    $PROJECT_ID:minigo_v5_19.moves \
-    gs://$BUCKET_NAME/bigquery/holdout/moves/* \
+    $PROJECT_ID:$DATASET_ID.moves \
+    gs://$BUCKET_NAME/bigquery/moves/* \
     oneoffs/bigquery_moves_schema.json
 
 '''
@@ -27,52 +35,70 @@ sys.path.insert(0, '.')
 import collections
 import json
 import os
+import random
 import re
 
 from absl import app, flags
 from tensorflow import gfile
 from tqdm import tqdm
-import sgf
 
 import coords
+import go
 import sgf_wrapper
-import shipname
 import utils
 
 DebugRow = collections.namedtuple('DebugRow', [
     'move', 'action', 'Q', 'U', 'prior', 'orig_prior', 'N', 'soft_N', 'p_delta', 'p_rel'])
 
-BUCKET_NAME = os.environ['BUCKET_NAME']
-BASE_GS_DIR = 'gs://{}'.format(BUCKET_NAME)
-HOLDOUT_PATH = os.path.join('{}', 'data', 'holdout', '{}')
-PATH_TEMPLATE = os.path.join('{}', 'sgf', '{}', 'full', '{}')
-OUTPUT_PATH = os.path.join('{}', 'bigquery', 'holdout', '{}', '{}')
+flags.DEFINE_float("sampling_frac", 0.05, "Fraction of SGFs to process.")
 
-flags.DEFINE_string("base_dir", BASE_GS_DIR, "base directory for minigo data")
+flags.DEFINE_string("sgf_dir", None, "base directory for full debug minigo sgfs")
 
-flags.DEFINE_boolean("only_top_move", False,
-                     "only include policy and playout data about played move")
+flags.DEFINE_string("output_dir", None, "output directory for bigquery data")
 
 FLAGS = flags.FLAGS
 
+FILENAME_RE = re.compile(r'(\d+)-tpu-player-deployment-(.*)\.sgf')
 
-def get_sgf_names(model):
-    game_dir = HOLDOUT_PATH.format(FLAGS.base_dir, model)
-    tf_records = map(os.path.basename, gfile.ListDirectory(game_dir))
-    sgfs = [record.replace('.tfrecord.zz', '.sgf') for record in tf_records]
-    return [PATH_TEMPLATE.format(FLAGS.base_dir, model, sgf) for sgf in sgfs]
+def _get_timestamp_worker_id(filename):
+    match = FILENAME_RE.search(filename)
+    if match and len(match.groups()) == 2:
+        timestamp, worker_id = match.groups()
+        return int(timestamp), worker_id
+    raise ValueError("Couldn't parse {}".format(filename))
+
+def _get_model_num(model_comment):
+    '''
+    Takes a comment string like
+    "models:gs://some-bucket/work_dir/model.ckpt-139529,gs://some-bucket/work_dir/model.ckpt-123"
+    and turns it into
+    139529
+    '''
+    try:
+        matches = re.findall('(\d+)($|,)', model_comment)
+        # => [('139529', ','), ('123', '')]
+        models = [int(match[0]) for match in matches]
+        # => [139529, 123]
+        return max(models)
+    except:
+        print(model_comment)
+        return 0
 
 
-def extract_holdout_model(model):
-    game_output_path = OUTPUT_PATH.format(FLAGS.base_dir, 'games', model)
-    move_output_path = OUTPUT_PATH.format(FLAGS.base_dir, 'moves', model)
-    gfile.MakeDirs(os.path.basename(game_output_path))
-    gfile.MakeDirs(os.path.basename(move_output_path))
+def list_sgfs(path):
+    sgfs = gfile.Glob(os.path.join(path, '*.sgf'))
+    return [sgf for sgf in sgfs if random.random() < FLAGS.sampling_frac]
 
-    with gfile.GFile(game_output_path, 'w') as game_f, \
-            gfile.GFile(move_output_path, 'w') as move_f:
-        for sgf_name in tqdm(get_sgf_names(model)):
-            game_data, move_data = extract_data(sgf_name)
+def process_directory(sgf_dir_path, output_dir_path):
+    sgf_dirname = os.path.basename(sgf_dir_path)
+
+    games_path = os.path.join(output_dir_path, 'games', sgf_dirname)
+    moves_path = os.path.join(output_dir_path, 'moves', sgf_dirname)
+
+    with gfile.GFile(games_path, 'w') as game_f, \
+            gfile.GFile(moves_path, 'w') as move_f:
+        for sgf_path in tqdm(list_sgfs(sgf_dir_path)):
+            game_data, move_data = extract_data(sgf_path)
             game_f.write(json.dumps(game_data) + '\n')
             for move_datum in move_data:
                 move_f.write(json.dumps(move_datum) + '\n')
@@ -86,25 +112,20 @@ def extract_data(filename):
     move_data = extract_move_data(
         root_node,
         game_data['worker_id'],
-        game_data['completed_time'],
-        game_data['board_size'])
+        game_data['completed_time'])
     return game_data, move_data
 
 
 def extract_game_data(gcs_path, root_node):
     props = root_node.properties
-    komi = float(sgf_wrapper.sgf_prop(props.get('KM')))
     result = sgf_wrapper.sgf_prop(props.get('RE', ''))
     board_size = int(sgf_wrapper.sgf_prop(props.get('SZ')))
+    if board_size != go.N:
+        raise Exception("Game file uses BOARD_SIZE={} but script was run with BOARD_SIZE={}".format(board_size, go.N))
     value = utils.parse_game_result(result)
     was_resign = '+R' in result
 
-    filename = os.path.basename(gcs_path)
-    filename_no_ext, _ = os.path.splitext(filename)
-    # BigQuery's TIMESTAMP() takes in unix millis.
-    completion_millis = 1000 * int(filename_no_ext.split('-')[0])
-    worker_id = filename_no_ext.split('-')[-1]
-    model_num = shipname.detect_model_num(props.get('PW')[0])
+    completed_time, worker_id = _get_timestamp_worker_id(gcs_path)
     sgf_url = gcs_path
     first_comment_node_lines = root_node.next.properties['C'][0].split('\n')
     # in-place edit to comment node so that first move's comment looks
@@ -115,9 +136,8 @@ def extract_game_data(gcs_path, root_node):
 
     return {
         'worker_id': worker_id,
-        'completed_time': completion_millis,
+        'completed_time': completed_time,
         'board_size': board_size,
-        'model_num': model_num,
         'result_str': result,
         'value': value,
         'was_resign': was_resign,
@@ -126,7 +146,7 @@ def extract_game_data(gcs_path, root_node):
     }
 
 
-def extract_move_data(root_node, worker_id, completed_time, board_size):
+def extract_move_data(root_node, worker_id, completed_time):
     current_node = root_node.next
     move_data = []
     move_num = 1
@@ -141,32 +161,27 @@ def extract_move_data(root_node, worker_id, completed_time, board_size):
         else:
             import pdb; pdb.set_trace()
         move_played = coords.to_flat(coords.from_sgf(move_played))
-        post_Q, debug_rows = parse_comment_node(props['C'][0])
+        post_Q, model_num, debug_rows = parse_comment_node(props['C'][0])
 
         def get_row_data(debug_row):
             column_names = ["prior", "orig_prior", "N", "soft_N"]
             return [getattr(debug_row, field) for field in column_names]
 
-        if FLAGS.only_top_move:
-            assert len(debug_rows) <= 1
-            row_data = list(map(get_row_data, debug_rows))
+        if not debug_rows:
+            row_data = [None, None, None, None]
         else:
-            row_data = [[0,0,0,0] for _ in range(board_size * board_size + 1)]
-            for debug_row in debug_rows:
-                move = debug_row.move
-                row_data[move] = get_row_data(debug_row)
+            row_data = get_row_data(debug_rows[0])
+        policy_prior, policy_prior_orig, mcts_visits, mcts_visits_norm = row_data
 
-        policy_prior, policy_prior_orig, mcts_visits, mcts_visits_norm = \
-            zip(*row_data)
 
         move_data.append({
             'worker_id': worker_id,
             'completed_time': completed_time,
+            'model_num': model_num,
             'move_num': move_num,
             'turn_to_play': to_play,
             'move': move_played,
             'move_kgs': coords.to_kgs(coords.from_flat(move_played)),
-            'prior_Q': None,
             'post_Q': post_Q,
             'policy_prior': policy_prior,
             'policy_prior_orig': policy_prior_orig,
@@ -183,6 +198,7 @@ def parse_comment_node(comment):
     # for the first move in the game; it gets preprocessed by extract_game_data
     """
     Resign Threshold: -0.88
+    models:gs://some-bucket/work_dir/model.ckpt-139529
     -0.0662
     D4 (100) ==> D16 (14) ==> Q16 (3) ==> Q4 (1) ==> Q: -0.07149
     move: action Q U P P-Dir N soft-N p-delta p-rel
@@ -194,10 +210,11 @@ def parse_comment_node(comment):
     if lines[0].startswith('Resign'):
         lines = lines[1:]
 
-    post_Q = float(lines[0])
+    model_num = _get_model_num(lines[0])
+    post_Q = float(lines[1])
     debug_rows = []
     comment_splitter = re.compile(r'[ :,]')
-    for line in lines[3:]:
+    for line in lines[4:]:
         if not line:
             continue
         columns = comment_splitter.split(line)
@@ -205,18 +222,17 @@ def parse_comment_node(comment):
         coord, *other_columns = columns
         coord = coords.to_flat(coords.from_kgs(coord))
         debug_rows.append(DebugRow(coord, *map(float, other_columns)))
-        if FLAGS.only_top_move:
+        if True:
             break
-    return post_Q, debug_rows
+    return post_Q, model_num, debug_rows
 
 
-def main(unusedargv):
-    if len(unusedargv) != 2:
-        print("Usage: python {} 000001-model-name")
-        sys.exit(1)
-
-    model = unusedargv[1]
-    extract_holdout_model(model)
+def main(argv):
+    del argv
+    sgf_dir = FLAGS.sgf_dir
+    if sgf_dir.endswith('/'):
+        sgf_dir = sgf_dir.rstrip('/')
+    process_directory(FLAGS.sgf_dir, FLAGS.output_dir)
 
 
 if __name__ == '__main__':
