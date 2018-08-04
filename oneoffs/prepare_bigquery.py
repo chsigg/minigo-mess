@@ -3,12 +3,18 @@ Script to process debug SGFs for upload to BigQuery.
 
 Handles one directory per invocation, for easy sharding of work.
 
-Usage:
+Usage (single file):
 BOARD_SIZE=19 python oneoffs/prepare_bigquery.py \
     --sgf_dir=gs://$BUCKET_NAME/sgf/full/2018-07-20-00/
     --output_dir=gs://$BUCKET_NAME/bigquery/
 
-
+Usage (multiple files)
+export BOARD_SIZE=19
+gsutil ls gs://$BUCKET_NAME/sgf/full | \
+    xargs -I '{}' python3 oneoffs/prepare_bigquery.py \
+    -n 1 -P 32 \
+    --sgf_dir='{}' \
+    --output_dir=gs://tensor-go-minigo-v9-19/bigquery
 The load commands look like:
 
 export PROJECT_ID=blah
@@ -17,12 +23,14 @@ export DATASET_ID=minigo_v9_19
 bq mk --project_id=$PROJECT_ID $DATASET_ID
 
 bq load --project_id=$PROJECT_ID \
+    --replace \
     --source_format=NEWLINE_DELIMITED_JSON \
     $PROJECT_ID:$DATASET_ID.games \
     gs://$BUCKET_NAME/bigquery/games/* \
     oneoffs/bigquery_games_schema.json
 
 bq load --project_id=$PROJECT_ID \
+    --replace \
     --source_format=NEWLINE_DELIMITED_JSON \
     $PROJECT_ID:$DATASET_ID.moves \
     gs://$BUCKET_NAME/bigquery/moves/* \
@@ -100,8 +108,8 @@ def process_directory(sgf_dir_path, output_dir_path):
         for sgf_path in tqdm(list_sgfs(sgf_dir_path)):
             game_data, move_data = extract_data(sgf_path)
             game_f.write(json.dumps(game_data) + '\n')
-            for move_datum in move_data:
-                move_f.write(json.dumps(move_datum) + '\n')
+            move_f.write(''.join(json.dumps(move_datum) + '\n'
+                                 for move_datum in move_data))
 
 
 def extract_data(filename):
