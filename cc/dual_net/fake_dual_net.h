@@ -12,28 +12,30 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef CC_DUAL_NET_FAKE_NET_H_
-#define CC_DUAL_NET_FAKE_NET_H_
+#ifndef CC_DUAL_NET_FAKE_DUAL_NET_H_
+#define CC_DUAL_NET_FAKE_DUAL_NET_H_
 
-#include <array>
+#include <vector>
 
 #include "cc/dual_net/dual_net.h"
 
 namespace minigo {
 
-class FakeNet : public DualNet {
+class FakeDualNetFactory : public DualNetFactory {
  public:
-  FakeNet() : FakeNet(absl::Span<const float>(), 0) {}
-  FakeNet(absl::Span<const float> priors, float value);
+  FakeDualNetFactory() : FakeDualNetFactory(absl::Span<const float>(), 0) {}
+  FakeDualNetFactory(absl::Span<const float> priors, float value)
+      : DualNetFactory(""),
+        priors_(priors.begin(), priors.end()),
+        value_(value) {}
 
-  void RunMany(absl::Span<const BoardFeatures> features,
-               absl::Span<Output> outputs, std::string* model) override;
+  std::unique_ptr<DualNet> New() override;
 
  private:
-  std::array<float, kNumMoves> priors_;
+  std::vector<float> priors_;
   float value_;
 };
 
 }  // namespace minigo
 
-#endif  // CC_DUAL_NET_FAKE_NET_H_
+#endif  // CC_DUAL_NET_FAKE_DUAL_NET_H_

@@ -14,13 +14,18 @@
 
 #include "cc/dual_net/tf_dual_net.h"
 
+#include "absl/memory/memory.h"
 #include "absl/strings/str_cat.h"
+#include "absl/types/span.h"
 #include "cc/check.h"
 #include "cc/constants.h"
+#include "cc/thread_safe_queue.h"
 #include "tensorflow/core/framework/graph.pb.h"
+#include "tensorflow/core/framework/tensor.h"
 #include "tensorflow/core/lib/core/errors.h"
 #include "tensorflow/core/lib/core/status.h"
 #include "tensorflow/core/platform/env.h"
+#include "tensorflow/core/public/session.h"
 
 using tensorflow::DT_FLOAT;
 using tensorflow::Env;
@@ -33,80 +38,170 @@ using tensorflow::TensorShape;
 
 namespace minigo {
 
-TfDualNet::TfDualNet(const std::string& graph_path) : graph_path_(graph_path) {
-  GraphDef graph_def;
+namespace {
+class TfWorker {
+ public:
+  explicit TfWorker(const tensorflow::GraphDef& graph_def) {
+    tensorflow::SessionOptions options;
+    options.config.mutable_gpu_options()->set_allow_growth(true);
+    session_.reset(tensorflow::NewSession(options));
+    TF_CHECK_OK(session_->Create(graph_def));
 
-  // If we can't find the specified graph, try adding a .pb extension.
-  auto* env = Env::Default();
-  if (!env->FileExists(graph_path_).ok()) {
-    auto alt_path = absl::StrCat(graph_path_, ".pb");
-    if (env->FileExists(alt_path).ok()) {
-      std::cerr << graph_path << " doesn't exist, using " << alt_path
-                << std::endl;
-      graph_path_ = alt_path;
+    inputs_.emplace_back("pos_tensor",
+                         tensorflow::Tensor(tensorflow::DT_FLOAT,
+                                            tensorflow::TensorShape(
+                                                {FLAGS_batch_size, kN, kN,
+                                                 DualNet::kNumStoneFeatures})));
+
+    output_names_.push_back("policy_output");
+    output_names_.push_back("value_output");
+  }
+
+  ~TfWorker() {
+    if (session_ != nullptr) {
+      TF_CHECK_OK(session_->Close());
     }
   }
 
-  TF_CHECK_OK(ReadBinaryProto(env, graph_path_, &graph_def));
+  void RunMany(absl::Span<const DualNet::BoardFeatures*> features,
+               absl::Span<DualNet::Output*> outputs) {
+    MG_DCHECK(features.size() == outputs.size());
 
-  SessionOptions options;
-  options.config.mutable_gpu_options()->set_allow_growth(true);
-  session_.reset(NewSession(options));
-  TF_CHECK_OK(session_->Create(graph_def));
+    // Copy the features into the input tensor.
+    auto* feature_data = inputs_.front().second.flat<float>().data();
+    for (const auto* feature : features) {
+      // Copy the features into the input tensor.
+      feature_data = std::copy(feature->begin(), feature->end(), feature_data);
+    }
 
-  inputs_.clear();
-  inputs_.emplace_back(
-      "pos_tensor",
-      Tensor(DT_FLOAT, TensorShape({1, kN, kN, kNumStoneFeatures})));
+    // Run the model.
+    TF_CHECK_OK(session_->Run(inputs_, output_names_, {}, &outputs_));
 
-  output_names_.clear();
-  output_names_.push_back("policy_output");
-  output_names_.push_back("value_output");
-
-  // Tensorflow lazily initializes the first time Session::Run is called, which
-  // can take hundreds of milliseconds. This intefers with time control, so
-  // explicitly run inference once during construction.
-  Output output;
-  BoardFeatures features;
-  RunMany({&features, 1}, {&output, 1}, nullptr);
-}
-
-TfDualNet::~TfDualNet() {
-  if (session_ != nullptr) {
-    TF_CHECK_OK(session_->Close());
-  }
-}
-
-void TfDualNet::RunMany(absl::Span<const BoardFeatures> features,
-                        absl::Span<Output> outputs, std::string* model) {
-  MG_DCHECK(features.size() == outputs.size());
-
-  int batch_size = static_cast<int>(features.size());
-  auto& feature_tensor = inputs_[0].second;
-  if (feature_tensor.dim_size(0) != batch_size) {
-    feature_tensor =
-        Tensor(DT_FLOAT, TensorShape({batch_size, kN, kN, kNumStoneFeatures}));
+    // Copy the policy and value out of the output tensors.
+    const auto* policy_data = outputs_[0].flat<float>().data();
+    const auto* value_data = outputs_[1].flat<float>().data();
+    for (auto* output : outputs) {
+      std::copy_n(policy_data, kNumMoves, output->policy.begin());
+      policy_data += kNumMoves;
+      output->value = *value_data++;
+    }
   }
 
-  // Copy the features into the input tensor.
-  memcpy(feature_tensor.flat<float>().data(), features.data(),
-         features.size() * sizeof(BoardFeatures));
+ private:
+  std::unique_ptr<tensorflow::Session> session_;
+  std::vector<std::pair<std::string, tensorflow::Tensor>> inputs_;
+  std::vector<std::string> output_names_;
+  std::vector<tensorflow::Tensor> outputs_;
+};
+}  // namespace
 
-  // Run the model.
-  TF_CHECK_OK(session_->Run(inputs_, output_names_, {}, &outputs_));
+namespace internal {
+class TfService {
+  struct InferenceData {
+    DualNet::Task task;
+    absl::Span<const DualNet::BoardFeatures*> features;
+    absl::Span<DualNet::Output*> outputs;
+    std::string* model;
+  };
 
-  // Copy the policy and value out of the output tensors.
-  const auto& policy_tensor = outputs_[0].flat<float>();
-  const auto& value_tensor = outputs_[1].flat<float>();
-  for (int i = 0; i < batch_size; ++i) {
-    memcpy(outputs[i].policy.data(), policy_tensor.data() + i * kNumMoves,
-           sizeof(outputs[i].policy));
-    outputs[i].value = value_tensor.data()[i];
+ public:
+  TfService(std::string model_path) : running_(true) {
+    auto functor = [this, model_path](const tensorflow::GraphDef& graph_def) {
+      pthread_setname_np(pthread_self(), "TfWorker");
+      TfWorker worker(graph_def);
+      while (running_) {
+        InferenceData inference;
+        if (queue_.PopWithTimeout(&inference, absl::Seconds(1))) {
+          worker.RunMany(inference.features, inference.outputs);
+          if (inference.model) {
+            *inference.model = model_path;
+          }
+          inference.task();
+        }
+      }
+    };
+
+    // If we can't find the specified graph, try adding a .pb extension.
+    auto* env = tensorflow::Env::Default();
+    if (!env->FileExists(model_path).ok()) {
+      model_path = absl::StrCat(model_path, ".pb");
+    }
+
+    tensorflow::GraphDef graph_def;
+    TF_CHECK_OK(tensorflow::ReadBinaryProto(env, model_path, &graph_def));
+
+    for (int device_id = 0; device_id < FLAGS_num_gpus; ++device_id) {
+      auto device = std::to_string(device_id);
+      PlaceOnDevice(&graph_def, "/gpu:" + device);
+      // Two threads per device.
+      worker_threads_.emplace_back(functor, graph_def);
+      worker_threads_.emplace_back(functor, graph_def);
+    }
   }
 
-  if (model != nullptr) {
-    *model = graph_path_;
+  ~TfService() {
+    running_ = false;
+    for (auto& thread : worker_threads_) {
+      thread.join();
+    }
   }
+
+  void RunMany(DualNet::Task&& task,
+               absl::Span<const DualNet::BoardFeatures*> features,
+               absl::Span<DualNet::Output*> outputs, std::string* model) {
+    queue_.Push({std::move(task), features, outputs, model});
+  }
+
+ private:
+  static void PlaceOnDevice(tensorflow::GraphDef* graph_def,
+                            const std::string& device) {
+    for (auto& node : *graph_def->mutable_node()) {
+      if ([&] {
+            if (node.op() != "Const") {
+              return true;
+            }
+            auto it = node.attr().find("dtype");
+            if (it != node.attr().end() &&
+                it->second.type() == tensorflow::DT_INT32) {
+              return false;
+            }
+            return true;
+          }()) {
+        node.set_device(device);
+      }
+    }
+  }
+
+  ThreadSafeQueue<InferenceData> queue_;
+  std::vector<std::thread> worker_threads_;
+  std::atomic<bool> running_;
+};
+}  // namespace internal
+
+namespace {
+class TfDualNet : public DualNet {
+ public:
+  explicit TfDualNet(internal::TfService* service) : service_(service) {}
+
+  void RunMany(DualNet::Task&& task, absl::Span<const BoardFeatures*> features,
+               absl::Span<Output*> outputs, std::string* model) override {
+    service_->RunMany(std::move(task), features, outputs, model);
+  }
+
+ private:
+  internal::TfService* service_;
+};
+
+}  // namespace
+
+TfDualNetFactory::TfDualNetFactory(std::string model_path)
+    : DualNetFactory(model_path),
+      service_(new internal::TfService(model_path)) {}
+
+TfDualNetFactory::~TfDualNetFactory() = default;
+
+std::unique_ptr<DualNet> TfDualNetFactory::New() {
+  return absl::make_unique<TfDualNet>(service_.get());
 }
 
 }  // namespace minigo

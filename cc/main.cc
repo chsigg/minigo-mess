@@ -262,7 +262,7 @@ class SelfPlayer {
   struct GameOptions {
     void Init(int thread_id) {
       ParseMctsPlayerOptionsFromFlags(&player_options);
-      player_options.verbose = thread_id == 0;
+      player_options.verbose = false;  // TODO(csigg): revert to thread_id == 0;
       // If an random seed was explicitly specified, make sure we use a
       // different seed for each thread.
       if (player_options.random_seed != 0) {
@@ -285,6 +285,8 @@ class SelfPlayer {
   };
 
   void ThreadRun(int thread_id) {
+    pthread_setname_np(pthread_self(), "Player");
+
     // Only print the board using ANSI colors if stderr is sent to the
     // terminal.
     const bool use_ansi_colors = isatty(fileno(stderr));

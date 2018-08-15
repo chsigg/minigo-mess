@@ -14,8 +14,14 @@
 
 #include "cc/dual_net/dual_net.h"
 
+#include <vector>
+
 #include "cc/color.h"
 #include "cc/constants.h"
+
+// TODO(csigg): Expand explanation.
+DEFINE_int32(batch_size, 256, "Inference batch size.");
+DEFINE_int32(num_gpus, 1, "Number of GPUs to use.");
 
 namespace minigo {
 
@@ -65,5 +71,23 @@ void DualNet::SetFeatures(absl::Span<const Position::Stones* const> history,
 }
 
 DualNet::~DualNet() = default;
+
+void DualNet::RunMany(absl::Span<const BoardFeatures> features,
+                      absl::Span<Output> outputs, std::string* model) {
+  std::vector<const DualNet::BoardFeatures*> feature_ptrs;
+  feature_ptrs.reserve(features.size());
+  std::transform(features.begin(), features.end(),
+                 std::back_inserter(feature_ptrs),
+                 std::addressof<const BoardFeatures>);
+  std::vector<DualNet::Output*> output_ptrs;
+  output_ptrs.reserve(outputs.size());
+  std::transform(outputs.begin(), outputs.end(),
+                 std::back_inserter(output_ptrs), std::addressof<Output>);
+  Task task([] {});
+  auto future = task.get_future();
+  RunMany(std::move(task), absl::MakeSpan(feature_ptrs),
+          absl::MakeSpan(output_ptrs), model);
+  future.wait();
+}
 
 }  // namespace minigo

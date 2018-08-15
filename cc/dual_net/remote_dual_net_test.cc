@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "cc/dual_net/inference_server.h"
+#include "cc/dual_net/remote_dual_net.h"
 
 #include <memory>
 #include <vector>
@@ -20,7 +20,7 @@
 #include "absl/memory/memory.h"
 #include "absl/strings/str_cat.h"
 #include "cc/constants.h"
-#include "cc/dual_net/fake_net.h"
+#include "cc/dual_net/fake_dual_net.h"
 #include "cc/random.h"
 #include "gmock/gmock.h"
 #include "grpc++/create_channel.h"
@@ -41,7 +41,8 @@ class InferenceServerTest : public ::testing::Test {
     value_ = 0.1;
     dual_net_ = absl::make_unique<FakeNet>(priors_, value_);
 
-    server_ = absl::make_unique<InferenceServer>(virtual_losses_, games_per_inference_, port_);
+    server_ = absl::make_unique<RemoteDualNetFactory>(
+        virtual_losses_, games_per_inference_, port_);
     for (int i = 0; i < games_per_inference_; ++i) {
       clients_.push_back(server_->NewDualNet());
     }
@@ -55,7 +56,7 @@ class InferenceServerTest : public ::testing::Test {
   float value_;
 
   std::unique_ptr<DualNet> dual_net_;
-  std::unique_ptr<InferenceServer> server_;
+  std::unique_ptr<RemoteDualNetFactory> server_;
   std::vector<std::unique_ptr<DualNet>> clients_;
 };
 
@@ -108,7 +109,8 @@ TEST_F(InferenceServerTest, Test) {
     std::vector<DualNet::BoardFeatures> features(batch_size);
     for (int i = 0; i < batch_size; ++i) {
       for (int j = 0; j < DualNet::kNumBoardFeatures; ++j) {
-        features[i][j] = static_cast<float>(src[i * DualNet::kNumBoardFeatures + j]);
+        features[i][j] =
+            static_cast<float>(src[i * DualNet::kNumBoardFeatures + j]);
       }
     }
     std::vector<DualNet::Output> outputs(batch_size);

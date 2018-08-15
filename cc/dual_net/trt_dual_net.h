@@ -12,28 +12,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef CC_DUAL_NET_TF_DUAL_NET_H_
-#define CC_DUAL_NET_TF_DUAL_NET_H_
+#ifndef CC_DUAL_NET_TRT_DUAL_NET_H_
+#define CC_DUAL_NET_TRT_DUAL_NET_H_
 
 #include "cc/dual_net/dual_net.h"
 
 namespace minigo {
 
 namespace internal {
-class TfService;
+class TrtService;
 }
 
-class TfDualNetFactory : public DualNetFactory {
+class TrtDualNetFactory : public DualNetFactory {
  public:
-  TfDualNetFactory(std::string model_path);
-  ~TfDualNetFactory();
+  TrtDualNetFactory(std::string model_path);
+  ~TrtDualNetFactory();
 
   std::unique_ptr<DualNet> New() override;
 
  private:
-  std::unique_ptr<internal::TfService> service_;
+  std::unique_ptr<internal::TrtService> service_;
 };
 
 }  // namespace minigo
 
-#endif  // CC_DUAL_NET_TF_DUAL_NET_H_
+#endif  // CC_DUAL_NET_TRT_DUAL_NET_H_

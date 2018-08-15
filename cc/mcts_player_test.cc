@@ -21,7 +21,7 @@
 #include "cc/algorithm.h"
 #include "cc/color.h"
 #include "cc/constants.h"
-#include "cc/dual_net/fake_net.h"
+#include "cc/dual_net/fake_dual_net.h"
 #include "cc/position.h"
 #include "cc/test_utils.h"
 #include "gtest/gtest.h"
@@ -43,7 +43,7 @@ static constexpr char kAlmostDoneBoard[] = R"(
 class TestablePlayer : public MctsPlayer {
  public:
   explicit TestablePlayer(const Options& options)
-      : MctsPlayer(absl::make_unique<FakeNet>(), options) {}
+      : MctsPlayer(FakeDualNetFactory().New(), options) {}
 
   explicit TestablePlayer(std::unique_ptr<DualNet> network,
                           const Options& options)
@@ -51,8 +51,8 @@ class TestablePlayer : public MctsPlayer {
 
   TestablePlayer(absl::Span<const float> fake_priors, float fake_value,
                  const Options& options)
-      : MctsPlayer(absl::make_unique<FakeNet>(fake_priors, fake_value),
-                   options) {}
+      : MctsPlayer(FakeDualNetFactory(fake_priors, fake_value).New(), options) {
+  }
 
   using MctsPlayer::PickMove;
   using MctsPlayer::PlayMove;
@@ -67,7 +67,9 @@ class TestablePlayer : public MctsPlayer {
   }
 
   DualNet::Output Run(const DualNet::BoardFeatures& features) {
-    return network()->Run(features, nullptr);
+    DualNet::Output output;
+    network()->RunMany({&features, 1}, {&output, 1}, nullptr);
+    return output;
   }
 };
 
@@ -80,9 +82,11 @@ std::unique_ptr<TestablePlayer> CreateBasicPlayer(MctsPlayer::Options options) {
   DualNet::BoardFeatures features;
   std::vector<const Position::Stones*> positions = {
       &player->root()->position.stones()};
-  DualNet::SetFeatures(positions, Color::kBlack, &features);
+  DualNet::SetFeatures(absl::MakeConstSpan(positions), Color::kBlack,
+                       &features);
   auto output = player->Run(features);
-  first_node->IncorporateResults(output.policy, output.value, player->root());
+  first_node->IncorporateResults(absl::MakeSpan(output.policy), output.value,
+                                 player->root());
   return player;
 }
 
@@ -392,10 +396,10 @@ TEST(MctsPlayerTest, ExtractDataResignEnd) {
 // four connected neighbor is set true the policy is set to 0.01.
 class MergeFeaturesNet : public DualNet {
  public:
-  void RunMany(absl::Span<const BoardFeatures> features,
-               absl::Span<Output> outputs, std::string* model) override {
+  void RunMany(absl::Span<const BoardFeatures*> features,
+               absl::Span<Output*> outputs, std::string* model) override {
     for (size_t i = 0; i < features.size(); ++i) {
-      Run(features[i], &outputs[i]);
+      Run(*features[i], outputs[i]);
     }
     if (model != nullptr) {
       *model = "MergeFeaturesNet";

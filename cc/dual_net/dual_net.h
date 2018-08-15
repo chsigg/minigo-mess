@@ -15,14 +15,18 @@
 #ifndef CC_DUAL_NET_DUAL_NET_H_
 #define CC_DUAL_NET_DUAL_NET_H_
 
+#include <future>
 #include <memory>
 #include <string>
 #include <utility>
-#include <vector>
 
 #include "absl/types/span.h"
 #include "cc/constants.h"
 #include "cc/position.h"
+#include "gflags/gflags.h"
+
+DECLARE_int32(batch_size);
+DECLARE_int32(num_gpus);
 
 namespace minigo {
 
@@ -66,20 +70,39 @@ class DualNet {
     float value;
   };
 
+  using Task = std::packaged_task<void()>;
+
   virtual ~DualNet();
 
-  // Runs inference on a batch of input features.
-  // If `model` is non-null, it will be set with the name of the model used for
-  // the inference.
-  virtual void RunMany(absl::Span<const BoardFeatures> features,
-                       absl::Span<Output> outputs, std::string* model) = 0;
+  // Runs inference on a batch of input features and executes the task on
+  // completion.
+  virtual void RunMany(Task&& task, absl::Span<const BoardFeatures*> features,
+                       absl::Span<Output*> outputs, std::string* model) = 0;
 
-  // Runs inference on features from a single position.
-  Output Run(const BoardFeatures features, std::string* model) {
-    Output output;
-    RunMany({&features, 1}, {&output, 1}, model);
-    return output;
+  // Backwards compatible interface.
+  void RunMany(absl::Span<const BoardFeatures> features,
+               absl::Span<Output> outputs, std::string* model);
+
+ protected:
+  static std::future<void> GetImmediateFuture() {
+    std::promise<void> promise;
+    auto result = promise.get_future();
+    promise.set_value();
+    return result;
   }
+};
+
+class DualNetFactory {
+ public:
+  explicit DualNetFactory(std::string model_path)
+      : model_path_(std::move(model_path)) {}
+  virtual ~DualNetFactory();
+  virtual std::unique_ptr<DualNet> New() = 0;
+
+  const std::string& model() const { return model_path_; }
+
+ private:
+  const std::string model_path_;
 };
 
 }  // namespace minigo

@@ -360,7 +360,8 @@ void MctsPlayer::ProcessLeaves(absl::Span<MctsNode*> leaves) {
 
   // Run inference.
   outputs_.resize(leaves.size());
-  network_->RunMany(features_, absl::MakeSpan(outputs_), &model_);
+  network_->RunMany(absl::MakeSpan(features_), absl::MakeSpan(outputs_),
+                    &model_);
 
   // Record some information about the inference.
   if (!model_.empty()) {

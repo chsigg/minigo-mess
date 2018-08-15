@@ -9,19 +9,6 @@
 
 namespace minigo {
 
-class DualNetFactory {
- public:
-  explicit DualNetFactory(std::string model_path)
-      : model_path_(std::move(model_path)) {}
-  virtual ~DualNetFactory();
-  virtual std::unique_ptr<DualNet> New() = 0;
-
-  const std::string& model() const { return model_path_; }
-
- private:
-  const std::string model_path_;
-};
-
 std::unique_ptr<DualNetFactory> NewDualNetFactory(std::string model_path,
                                                   int parallel_games);
 
