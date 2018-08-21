@@ -42,23 +42,24 @@ static constexpr char kAlmostDoneBoard[] = R"(
 
 class TestablePlayer : public MctsPlayer {
  public:
-  explicit TestablePlayer(const Options& options)
-      : MctsPlayer(FakeDualNetFactory().New(), options) {}
-
-  explicit TestablePlayer(std::unique_ptr<DualNet> network,
-                          const Options& options)
-      : MctsPlayer(std::move(network), options) {}
-
-  TestablePlayer(absl::Span<const float> fake_priors, float fake_value,
+  TestablePlayer(std::unique_ptr<DualNet::Service> service,
+                 std::unique_ptr<DualNet::Client> client,
                  const Options& options)
-      : MctsPlayer(FakeDualNetFactory(fake_priors, fake_value).New(), options) {
-  }
+      : MctsPlayer(client.get(), options),
+        service_(std::move(service)),
+        client_(std::move(client)) {}
 
+  using MctsPlayer::InitializeGame;
   using MctsPlayer::PickMove;
   using MctsPlayer::PlayMove;
   using MctsPlayer::ProcessLeaves;
   using MctsPlayer::rnd;
   using MctsPlayer::TreeSearch;
+
+  void TreeSearch(int virtual_losses) {
+    mutable_options()->virtual_losses = virtual_losses;
+    TreeSearch().wait();
+  }
 
   std::array<float, kNumMoves> Noise() {
     std::array<float, kNumMoves> noise;
@@ -67,17 +68,27 @@ class TestablePlayer : public MctsPlayer {
   }
 
   DualNet::Output Run(const DualNet::BoardFeatures& features) {
-    DualNet::Output output;
-    network()->RunMany({&features, 1}, {&output, 1}, nullptr);
-    return output;
+    return network()->RunManyAsync({features}).get().outputs.front();
   }
+
+ private:
+  std::unique_ptr<DualNet::Service> service_;
+  std::unique_ptr<DualNet::Client> client_;
 };
+
+std::unique_ptr<TestablePlayer> CreatePlayer(
+    std::unique_ptr<DualNet> dual_net, const MctsPlayer::Options& options) {
+  auto service = absl::make_unique<DualNet::Service>(std::move(dual_net));
+  auto client = absl::make_unique<DualNet::Client>(service.get());
+  return absl::make_unique<TestablePlayer>(std::move(service),
+                                           std::move(client), options);
+}
 
 std::unique_ptr<TestablePlayer> CreateBasicPlayer(MctsPlayer::Options options) {
   // Always use a deterministic random seed.
   options.random_seed = 17;
 
-  auto player = absl::make_unique<TestablePlayer>(options);
+  auto player = CreatePlayer(absl::make_unique<FakeDualNet>(), options);
   auto* first_node = player->root()->SelectLeaf();
   DualNet::BoardFeatures features;
   std::vector<const Position::Stones*> positions = {
@@ -100,16 +111,14 @@ std::unique_ptr<TestablePlayer> CreateAlmostDonePlayer(int n) {
   // randomly transformed).
   options.random_symmetry = false;
 
-  std::array<float, kNumMoves> probs;
-  for (auto& p : probs) {
-    p = 0.001;
-  }
+  std::vector<float> probs(kNumMoves, 0.001f);
   probs[Coord(0, 2)] = 0.2;
   probs[Coord(0, 3)] = 0.2;
   probs[Coord(0, 4)] = 0.2;
   probs[Coord::kPass] = 0.2;
 
-  auto player = absl::make_unique<TestablePlayer>(probs, 0, options);
+  auto player =
+      CreatePlayer(absl::make_unique<FakeDualNet>(probs, 0.0f), options);
   auto board = TestablePosition(kAlmostDoneBoard, Color::kBlack, n);
   player->InitializeGame(board);
   return player;
@@ -288,8 +297,7 @@ TEST(MctsPlayerTest, LongGameTreeSearch) {
 TEST(MctsPlayerTest, ColdStartParallelTreeSearch) {
   MctsPlayer::Options options;
   options.random_seed = 17;
-  auto player = absl::make_unique<TestablePlayer>(absl::Span<const float>(),
-                                                  0.17, options);
+  auto player = CreatePlayer(absl::make_unique<FakeDualNet>(0.17f), options);
   auto* root = player->root();
 
   // Test that parallel tree search doesn't trip on an empty tree.
@@ -310,15 +318,12 @@ TEST(MctsPlayerTest, ColdStartParallelTreeSearch) {
 TEST(MctsPlayerTest, TreeSearchFailsafe) {
   // Test that the failsafe works correctly. It can trigger if the MCTS
   // repeatedly visits a finished game state.
-  std::array<float, kNumMoves> probs;
-  for (auto& p : probs) {
-    p = 0.001;
-  }
+  std::vector<float> probs(kNumMoves, 0.001);
   probs[Coord::kPass] = 1;  // Make the dummy net always want to pass.
 
   MctsPlayer::Options options;
   options.random_seed = 17;
-  auto player = absl::make_unique<TestablePlayer>(probs, 0, options);
+  auto player = CreatePlayer(absl::make_unique<FakeDualNet>(probs, 0), options);
   auto board = TestablePosition("");
   board.PlayMove("pass");
   player->InitializeGame(board);
@@ -339,7 +344,8 @@ TEST(MctsPlayerTest, OnlyCheckGameEndOnce) {
   // W passes. If B passes too, B would lose by komi..
   position.PlayMove(Coord::kPass);
 
-  auto player = absl::make_unique<TestablePlayer>(MctsPlayer::Options());
+  auto player =
+      CreatePlayer(absl::make_unique<FakeDualNet>(), MctsPlayer::Options());
   player->InitializeGame(position);
   auto* root = player->root();
 
@@ -355,7 +361,8 @@ TEST(MctsPlayerTest, OnlyCheckGameEndOnce) {
 }
 
 TEST(MctsPlayerTest, ExtractDataNormalEnd) {
-  auto player = absl::make_unique<TestablePlayer>(MctsPlayer::Options());
+  auto player =
+      CreatePlayer(absl::make_unique<FakeDualNet>(), MctsPlayer::Options());
   player->TreeSearch(1);
   player->PlayMove(Coord::kPass);
   player->TreeSearch(1);
@@ -373,7 +380,8 @@ TEST(MctsPlayerTest, ExtractDataNormalEnd) {
 }
 
 TEST(MctsPlayerTest, ExtractDataResignEnd) {
-  auto player = absl::make_unique<TestablePlayer>(MctsPlayer::Options());
+  auto player =
+      CreatePlayer(absl::make_unique<FakeDualNet>(), MctsPlayer::Options());
   player->TreeSearch(1);
   player->PlayMove({0, 0});
   player->TreeSearch(1);
@@ -396,14 +404,15 @@ TEST(MctsPlayerTest, ExtractDataResignEnd) {
 // four connected neighbor is set true the policy is set to 0.01.
 class MergeFeaturesNet : public DualNet {
  public:
-  void RunMany(absl::Span<const BoardFeatures*> features,
-               absl::Span<Output*> outputs, std::string* model) override {
+  MergeFeaturesNet() : DualNet("MergeFeaturesNet") {}
+
+  void RunManyAsync(std::vector<const BoardFeatures*>&& features,
+                    std::vector<Output*>&& outputs,
+                    Continuation continuation) override {
     for (size_t i = 0; i < features.size(); ++i) {
       Run(*features[i], outputs[i]);
     }
-    if (model != nullptr) {
-      *model = "MergeFeaturesNet";
-    }
+    continuation(model_path_);
   }
 
  private:
@@ -429,12 +438,13 @@ TEST(MctsPlayerTest, SymmetriesTest) {
   MctsPlayer::Options options;
   options.random_seed = 17;
   options.random_symmetry = true;
-  TestablePlayer player(absl::make_unique<MergeFeaturesNet>(), options);
+
+  auto player = CreatePlayer(absl::make_unique<MergeFeaturesNet>(), options);
 
   // Without playing a move, all features planes should be zero except the last
   // one (it's black's turn to play).
-  auto* root = player.root();
-  player.ProcessLeaves({&root, 1});
+  auto* root = player->root();
+  player->ProcessLeaves({root}).wait();
   for (int i = 0; i < kN * kN; ++i) {
     ASSERT_EQ(0.0, root->child_P(i));
   }
@@ -457,7 +467,7 @@ TEST(MctsPlayerTest, SymmetriesTest) {
   // the symmetries.
   for (int i = 0; i < 100; ++i) {
     auto* leaf = nodes.back().get();
-    player.ProcessLeaves({&leaf, 1});
+    player->ProcessLeaves({leaf}).wait();
     ASSERT_EQ(0.0, leaf->child_P(Coord::FromKgs("pass")));
     for (const auto move : moves) {
       // Playing where stones exist is illegal and should have been marked as 0.

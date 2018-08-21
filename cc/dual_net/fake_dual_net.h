@@ -24,6 +24,7 @@ namespace minigo {
 class FakeDualNet : public DualNet {
  public:
   FakeDualNet();
+  explicit FakeDualNet(float value);
   FakeDualNet(std::vector<float> priors, float value);
 
   void RunManyAsync(std::vector<const BoardFeatures*>&& features,

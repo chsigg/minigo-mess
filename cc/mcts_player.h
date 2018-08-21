@@ -162,7 +162,10 @@ class MctsPlayer {
   Coord PickMove();
 
   // Performs an asynchronous tree search.
-  virtual std::future<std::vector<MctsNode*>> TreeSearch(int virtual_losses);
+  std::future<void> TreeSearch();
+
+  // Called at the end of TreeSearch.
+  virtual void NotifyTreeSearched(const std::vector<MctsNode*>& leaves);
 
   // Returns the root of the game tree.
   MctsNode* game_root() { return &game_root_; }
@@ -178,8 +181,6 @@ class MctsPlayer {
   std::future<void> ProcessLeaves(const std::vector<MctsNode*>& leaves);
 
  private:
-  std::future<void> TreeSearch();
-
   void PushHistory(Coord c);
 
   DualNet::Client* network_;  // Not owned.

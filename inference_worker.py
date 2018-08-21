@@ -359,19 +359,14 @@ class Worker(object):
             raise RuntimeError("Board size mismatch: server=%d, worker=%d" % (
                 config.board_size, go.N))
 
-        positions_per_inference = (config.games_per_inference *
-                                   config.virtual_losses)
-        if positions_per_inference % self.parallel_inferences != 0:
+        if config.batch_size % self.parallel_inferences != 0:
             raise RuntimeError(
-                "games_per_inference * virtual_losses must be divisible by "
-                "parallel_tpus")
-        self.batch_size = positions_per_inference // self.parallel_inferences
+                "config.batch_size must be divisible by parallel_tpus")
+        self.batch_size = config.batch_size // self.parallel_inferences
 
         dbg("parallel_inferences = %d" % self.parallel_inferences)
-        dbg("games_per_inference = %d" % config.games_per_inference)
-        dbg("virtual_losses = %d" % config.virtual_losses)
-        dbg("positions_per_inference = %d" % positions_per_inference)
-        dbg("batch_size = %d" % self.batch_size)
+        dbg("config.batch_size = %d" % config.batch_size)
+        dbg("self.batch_size = %d" % self.batch_size)
 
     def _run_threads(self):
         """Run inference threads and optionally a thread that updates the model.

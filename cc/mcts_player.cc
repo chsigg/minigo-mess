@@ -151,7 +151,8 @@ Coord MctsPlayer::PickMove() {
   return c;
 }
 
-std::future<std::vector<MctsNode*>> MctsPlayer::TreeSearch(int virtual_losses) {
+std::future<void> MctsPlayer::TreeSearch() {
+  int virtual_losses = options_.virtual_losses;
   int max_iterations = virtual_losses * 2;
 
   std::vector<MctsNode*> leaves;
@@ -175,29 +176,24 @@ std::future<std::vector<MctsNode*>> MctsPlayer::TreeSearch(int virtual_losses) {
   }
 
   if (leaves.empty()) {
-    return std::async(std::launch::deferred,
-                      [] { return std::vector<MctsNode*>(); });
+    NotifyTreeSearched({});
+    return std::async(std::launch::deferred, [] {});
   }
 
   auto future = ProcessLeaves(leaves);
   return std::async(
       std::launch::deferred,
-      [this](std::future<void> future, std::vector<MctsNode*>&& leaves) {
+      [this](std::future<void> future, const std::vector<MctsNode*>& leaves) {
         future.wait();
         for (auto* leaf : leaves) {
           leaf->RevertVirtualLoss(root_);
         }
-        return leaves;
+        NotifyTreeSearched(leaves);
       },
       std::move(future), std::move(leaves));
 }
 
-std::future<void> MctsPlayer::TreeSearch() {
-  return std::async(
-      std::launch::deferred,
-      [](std::future<std::vector<MctsNode*>> future) { future.wait(); },
-      TreeSearch(options_.virtual_losses));
-}
+void MctsPlayer::NotifyTreeSearched(const std::vector<MctsNode*>& leaves) {}
 
 bool MctsPlayer::ShouldResign() const {
   return root_->Q_perspective() < options_.resign_threshold;

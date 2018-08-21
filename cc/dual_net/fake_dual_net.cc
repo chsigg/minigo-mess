@@ -18,11 +18,13 @@
 #include "cc/check.h"
 
 namespace minigo {
-FakeDualNet::FakeDualNet()
-    : FakeDualNet(std::vector<float>(kNumMoves, 1.0f / kNumMoves), 0.0f) {}
+FakeDualNet::FakeDualNet() : FakeDualNet(0.0f) {}
+
+FakeDualNet::FakeDualNet(float value)
+    : FakeDualNet(std::vector<float>(kNumMoves, 1.0f / kNumMoves), value) {}
 
 FakeDualNet::FakeDualNet(std::vector<float> priors, float value)
-    : DualNet(""), priors_(std::move(priors)), value_(value) {}
+    : DualNet("FakeDualNet"), priors_(std::move(priors)), value_(value) {}
 
 void FakeDualNet::RunManyAsync(std::vector<const BoardFeatures*>&& features,
                                std::vector<Output*>&& outputs,

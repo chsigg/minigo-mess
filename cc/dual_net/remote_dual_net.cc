@@ -124,10 +124,7 @@ class RemoteDualNet : public DualNet, InferenceService::Service {
   Status GetConfig(ServerContext* context, const GetConfigRequest* request,
                    GetConfigResponse* response) override {
     response->set_board_size(kN);
-    // TODO(csigg): Change proto to virtual_losses = virtual_losses *
-    // games_per_inference.
-    response->set_virtual_losses(1);
-    response->set_games_per_inference(FLAGS_batch_size);
+    response->set_batch_size(FLAGS_batch_size);
     return Status::OK;
   }
 

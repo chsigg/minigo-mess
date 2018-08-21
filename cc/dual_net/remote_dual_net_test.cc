@@ -34,30 +34,17 @@ namespace {
 class InferenceServerTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    Random rnd;
-    for (int i = 0; i < kNumMoves; ++i) {
-      priors_.push_back(rnd());
-    }
+    std::generate_n(std::back_inserter(priors_), kNumMoves, Random());
     value_ = 0.1;
-    dual_net_ = absl::make_unique<FakeNet>(priors_, value_);
-
-    server_ = absl::make_unique<RemoteDualNetFactory>(
-        virtual_losses_, games_per_inference_, port_);
-    for (int i = 0; i < games_per_inference_; ++i) {
-      clients_.push_back(server_->NewDualNet());
-    }
+    fake_dual_net_ = absl::make_unique<FakeDualNet>(priors_, value_);
+    remove_dual_net_ = NewRemoteDualNet("RemoteDualNet");
   }
-
-  int port_ = 50051;
-  int virtual_losses_ = 8;
-  int games_per_inference_ = 2;
 
   std::vector<float> priors_;
   float value_;
 
-  std::unique_ptr<DualNet> dual_net_;
-  std::unique_ptr<RemoteDualNetFactory> server_;
-  std::vector<std::unique_ptr<DualNet>> clients_;
+  std::unique_ptr<DualNet> fake_dual_net_;
+  std::unique_ptr<DualNet> remove_dual_net_;
 };
 
 TEST_F(InferenceServerTest, Test) {
@@ -66,8 +53,9 @@ TEST_F(InferenceServerTest, Test) {
   // doesn't add any RPC ops to the TensorFlow graph. Instead, the RPCs and
   // proto marshalling is performed manually.
   std::thread server_thread([this]() {
+    int port = 50051;
     InferenceService::Stub stub(grpc::CreateChannel(
-        absl::StrCat("localhost:", port_), grpc::InsecureChannelCredentials()));
+        absl::StrCat("localhost:", port), grpc::InsecureChannelCredentials()));
 
     grpc::Status status;
 
@@ -83,13 +71,10 @@ TEST_F(InferenceServerTest, Test) {
     }
 
     int board_size = get_config_response.board_size();
-    int vlosses = get_config_response.virtual_losses();
-    int games_per_inference = get_config_response.games_per_inference();
+    int batch_size = get_config_response.batch_size();
 
     ASSERT_EQ(kN, board_size);
-    ASSERT_LT(0, vlosses);
-    ASSERT_LT(0, games_per_inference);
-    int batch_size = vlosses * games_per_inference;
+    ASSERT_LT(0, batch_size);
 
     // Get the features.
     GetFeaturesRequest get_features_request;
@@ -113,8 +98,8 @@ TEST_F(InferenceServerTest, Test) {
             static_cast<float>(src[i * DualNet::kNumBoardFeatures + j]);
       }
     }
-    std::vector<DualNet::Output> outputs(batch_size);
-    dual_net_->RunMany(features, absl::MakeSpan(outputs), nullptr);
+    std::vector<DualNet::Output> outputs =
+        std::move(fake_dual_net_->RunMany(std::move(features)).outputs);
 
     // Put the outputs.
     PutOutputsRequest put_outputs_request;
@@ -135,31 +120,12 @@ TEST_F(InferenceServerTest, Test) {
     }
   });
 
-  int vlosses = virtual_losses_;
-  std::vector<DualNet::BoardFeatures> features(vlosses * clients_.size());
-  std::vector<DualNet::Output> outputs(vlosses * clients_.size());
-  std::vector<std::thread> client_threads;
-  for (size_t i = 0; i < clients_.size(); ++i) {
-    auto* client = clients_[i].get();
-    auto* client_features = &features[i * vlosses];
-    auto* client_output = &outputs[i * vlosses];
-    client_threads.emplace_back([=]() {
-      auto size = static_cast<size_t>(vlosses);
-      client->RunMany({client_features, size}, {client_output, size}, nullptr);
-    });
-  }
-  for (auto& thread : client_threads) {
-    thread.join();
-  }
-
-  for (size_t i = 0; i < clients_.size(); ++i) {
-    for (int vloss = 0; vloss < vlosses; ++vloss) {
-      const auto& output = outputs[i * vlosses + vloss];
-      ASSERT_EQ(value_, output.value);
-      for (int i = 0; i < kNumMoves; ++i) {
-        ASSERT_EQ(priors_[i], output.policy[i]);
-      }
-    }
+  std::vector<DualNet::BoardFeatures> features(16);
+  auto result = remove_dual_net_->RunMany(std::move(features));
+  for (const auto& output : result.outputs) {
+    ASSERT_EQ(output.value, value_);
+    ASSERT_EQ(std::equal(priors_.begin(), priors_.end(), output.policy.begin()),
+              true);
   }
 
   server_thread.join();

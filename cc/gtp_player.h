@@ -53,7 +53,7 @@ class GtpPlayer : public MctsPlayer {
   Coord SuggestMove() override;
 
  protected:
-  std::future<std::vector<MctsNode*>> TreeSearch(int virtual_losses) override;
+  void NotifyTreeSearched(const std::vector<MctsNode*>& leaves) override;
 
  private:
   struct Response {

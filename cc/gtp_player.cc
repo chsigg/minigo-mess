@@ -101,7 +101,7 @@ bool GtpPlayer::MaybePonder() {
     std::cerr << "pondering...\n";
   }
 
-  TreeSearch(options().virtual_losses);
+  TreeSearch().wait();
 
   ponder_count_ += options().virtual_losses;
   if (ponder_count_ >= ponder_limit_) {
@@ -138,21 +138,14 @@ bool GtpPlayer::HandleCmd(const std::string& line) {
   return true;
 }
 
-std::future<std::vector<MctsNode*>> GtpPlayer::TreeSearch(int virtual_losses) {
-  return std::async(std::launch::deferred,
-                    [this](std::future<std::vector<MctsNode*>> future) {
-                      auto leaves = std::move(future.get());
-                      if (!leaves.empty() &&
-                          report_search_interval_ != absl::ZeroDuration()) {
-                        auto now = absl::Now();
-                        if (now - last_report_time_ > report_search_interval_) {
-                          last_report_time_ = now;
-                          ReportSearchStatus(leaves.back());
-                        }
-                      }
-                      return leaves;
-                    },
-                    MctsPlayer::TreeSearch(virtual_losses));
+void GtpPlayer::NotifyTreeSearched(const std::vector<MctsNode*>& leaves) {
+  if (!leaves.empty() && report_search_interval_ != absl::ZeroDuration()) {
+    auto now = absl::Now();
+    if (now - last_report_time_ > report_search_interval_) {
+      last_report_time_ = now;
+      ReportSearchStatus(leaves.back());
+    }
+  }
 }
 
 GtpPlayer::Response GtpPlayer::CheckArgsExact(absl::string_view cmd,

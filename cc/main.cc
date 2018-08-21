@@ -112,7 +112,7 @@ DEFINE_string(model_two, "",
               "model, also serialized as a GraphDef proto.");
 DEFINE_int32(parallel_games, 32,
              "Number of games to play in parallel. For performance reasons, "
-             "parallel_games should equal games_per_inference * 2 because this "
+             "parallel_games should equal batch_size * 2 because this "
              "allows the transfer of inference requests & responses to be "
              "overlapped with model evaluation.");
 DEFINE_int32(game_threads, 16, "Number of threads that play games.");

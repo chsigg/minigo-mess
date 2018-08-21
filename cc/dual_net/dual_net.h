@@ -135,7 +135,7 @@ class DualNet {
     Continuation() = default;
 
     template <typename F>
-    explicit Continuation(F&& f) : impl_(new ImplType<F>(std::forward(f))) {}
+    explicit Continuation(F&& f) : impl_(new ImplType<F>(std::forward<F>(f))) {}
 
     Continuation(Continuation&& other) = default;
     Continuation& operator=(Continuation&& other) = default;
@@ -161,8 +161,8 @@ class DualNet {
 
   template <typename SrcIt, typename DstIt>
   static void CopyPointers(SrcIt src_it, size_t n, DstIt dst_it) {
-    for (; 0 < n--;) {
-      *dst_it = &*src_it;
+    for (size_t i = 0; i < n; ++i) {
+      *dst_it++ = &*src_it++;
     }
   };
 

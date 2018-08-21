@@ -41,8 +41,8 @@ minigo_cc_library(
     deps = [
         "//cc:base",
         "//cc:position",
-        "@com_google_absl//absl/types:span",
         "@com_github_gflags_gflags//:gflags",
+        "@com_google_absl//absl/types:span",
     ],
 )
 
@@ -106,6 +106,7 @@ minigo_cc_library(
     name = "remote_dual_net",
     srcs = ["remote_dual_net.cc"],
     hdrs = ["remote_dual_net.h"],
+    data = ["//:inference_worker_py"],
     deps = [
         ":dual_net",
         "//cc:thread_safe_queue",
