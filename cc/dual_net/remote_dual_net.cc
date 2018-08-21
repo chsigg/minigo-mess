@@ -57,26 +57,20 @@ using grpc::Status;
 using grpc::StatusCode;
 
 namespace minigo {
-namespace internal {
+namespace {
 
 // The RemoteDualNet client pushes inference requests onto an instance of this
 // InferenceService.
-class InferenceServiceImpl final : public InferenceService::Service {
+class RemoteDualNet : public DualNet, InferenceService::Service {
   struct InferenceData {
-    DualNet::Task task;
-
-    // A batch of features to run inference on.
-    absl::Span<const DualNet::BoardFeatures*> features;
-
-    // Inference output for the batch.
-    absl::Span<DualNet::Output*> outputs;
-
-    // Model used for the inference.
-    std::string* model;
+    std::vector<const BoardFeatures*> features;
+    std::vector<Output*> outputs;
+    Continuation continuation;
   };
 
  public:
-  InferenceServiceImpl(std::string model_path) : batch_id_(1) {
+  explicit RemoteDualNet(const std::string& model_path)
+      : DualNet(model_path), batch_id_(1) {
     worker_thread_ = std::thread([=]() {
       std::vector<std::string> cmd_parts = {
           absl::StrCat("BOARD_SIZE=", kN),
@@ -108,30 +102,29 @@ class InferenceServiceImpl final : public InferenceService::Service {
       builder.RegisterService(this);
       return builder.BuildAndStart();
     }();
-    // TODO(csigg): LOG(INFO)?
     std::cerr << "Inference server listening on port " << FLAGS_port
               << std::endl;
     server_thread_ = std::thread([this]() { server_->Wait(); });
   }
 
-  ~InferenceServiceImpl() {
+  ~RemoteDualNet() override {
     server_->Shutdown(gpr_inf_past(GPR_CLOCK_REALTIME));
     server_thread_.join();
     worker_thread_.join();
   }
 
-  void RunMany(DualNet::Task&& task,
-               absl::Span<const DualNet::BoardFeatures*> features,
-               absl::Span<DualNet::Output*> outputs, std::string* model) {
-    inference_queue_.Push(
-        {std::move(task), std::move(features), std::move(outputs), model});
+  void RunManyAsync(std::vector<const BoardFeatures*>&& features,
+                    std::vector<Output*>&& outputs,
+                    Continuation continuation) override {
+    queue_.Push(
+        {std::move(features), std::move(outputs), std::move(continuation)});
   }
 
  private:
   Status GetConfig(ServerContext* context, const GetConfigRequest* request,
                    GetConfigResponse* response) override {
     response->set_board_size(kN);
-    // TODO(csigg): Change proto to batch_size = virtual_losses *
+    // TODO(csigg): Change proto to virtual_losses = virtual_losses *
     // games_per_inference.
     response->set_virtual_losses(1);
     response->set_games_per_inference(FLAGS_batch_size);
@@ -141,7 +134,7 @@ class InferenceServiceImpl final : public InferenceService::Service {
   Status GetFeatures(ServerContext* context, const GetFeaturesRequest* request,
                      GetFeaturesResponse* response) override {
     InferenceData inference;
-    while (!inference_queue_.PopWithTimeout(&inference, absl::Seconds(1))) {
+    while (!queue_.PopWithTimeout(&inference, absl::Seconds(1))) {
       if (context->IsCancelled()) {
         return Status(StatusCode::CANCELLED, "connection terminated");
       }
@@ -157,22 +150,22 @@ class InferenceServiceImpl final : public InferenceService::Service {
     response->set_features(std::move(byte_features));
 
     {
-      absl::MutexLock lock(&pending_inferences_mutex_);
-      pending_inferences_[response->batch_id()] = std::move(inference);
+      absl::MutexLock lock(&pending_mutex_);
+      pending_map_[response->batch_id()] = std::move(inference);
     }
 
     return Status::OK;
   }
 
   Status PutOutputs(ServerContext* context, const PutOutputsRequest* request,
-                    PutOutputsResponse* response) override {
+                    PutOutputsResponse* /*response*/) override {
     InferenceData inference;
     {
-      absl::MutexLock lock(&pending_inferences_mutex_);
-      auto it = pending_inferences_.find(request->batch_id());
-      MG_CHECK(it != pending_inferences_.end());
+      absl::MutexLock lock(&pending_mutex_);
+      auto it = pending_map_.find(request->batch_id());
+      MG_CHECK(it != pending_map_.end());
       inference = std::move(it->second);
-      pending_inferences_.erase(it);
+      pending_map_.erase(it);
     }
 
     // Check we got the expected number of values. (Note that because request
@@ -192,10 +185,7 @@ class InferenceServiceImpl final : public InferenceService::Service {
       outputs->value = *value_it++;
     }
 
-    if (inference.model != nullptr) {
-      *inference.model = request->model_path();
-    }
-    inference.task();
+    inference.continuation(request->model_path());
 
     return Status::OK;
   }
@@ -208,44 +198,20 @@ class InferenceServiceImpl final : public InferenceService::Service {
 
   std::atomic<int32_t> batch_id_;
 
-  ThreadSafeQueue<InferenceData> inference_queue_;
+  ThreadSafeQueue<InferenceData> queue_;
 
-  // Mutex that protects access to pending_inferences_.
-  absl::Mutex pending_inferences_mutex_;
+  // Mutex that protects access to pending_map_.
+  absl::Mutex pending_mutex_;
 
   // Map from batch ID to list of remote inference requests in that batch.
-  std::unordered_map<int32_t, InferenceData> pending_inferences_
-      GUARDED_BY(&pending_inferences_mutex_);
-
-  friend class RemoteDualNet;
+  std::unordered_map<int32_t, InferenceData> pending_map_
+      GUARDED_BY(&pending_mutex_);
 };
-}  // namespace internal
 
-namespace {
-
-class RemoteDualNet : public DualNet {
- public:
-  explicit RemoteDualNet(internal::InferenceServiceImpl* service)
-      : service_(service) {}
-
-  void RunMany(Task&& task, absl::Span<const BoardFeatures*> features,
-               absl::Span<Output*> outputs, std::string* model) override {
-    return service_->RunMany(std::move(task), features, outputs, model);
-  }
-
- private:
-  internal::InferenceServiceImpl* service_;
-};
 }  // namespace
 
-RemoteDualNetFactory::RemoteDualNetFactory(std::string model_path)
-    : DualNetFactory(std::move(model_path)),
-      service_(new internal::InferenceServiceImpl(model())) {}
-
-RemoteDualNetFactory::~RemoteDualNetFactory() = default;
-
-std::unique_ptr<DualNet> RemoteDualNetFactory::New() {
-  return absl::make_unique<RemoteDualNet>(service_.get());
+std::unique_ptr<DualNet> NewRemoteDualNet(const std::string& model_path) {
+  return absl::make_unique<RemoteDualNet>(model_path);
 }
 
 }  // namespace minigo

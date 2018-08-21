@@ -38,9 +38,8 @@ namespace minigo {
 namespace {
 class LiteDualNet : public DualNet {
  public:
-  explicit LiteDualNet(const std::string& graph_path)
-      : graph_path_(graph_path) {
-    model_ = FlatBufferModel::BuildFromFile(graph_path.c_str());
+  explicit LiteDualNet(const std::string& model_path) : DualNet(model_path) {
+    model_ = FlatBufferModel::BuildFromFile(model_path.c_str());
     MG_CHECK(model_ != nullptr);
 
     BuiltinOpResolver resolver;
@@ -92,8 +91,9 @@ class LiteDualNet : public DualNet {
 
   ~LiteDualNet() override = default;
 
-  void RunMany(Task&& task, absl::Span<const BoardFeatures*> features,
-               absl::Span<Output*> outputs, std::string* model) override {
+  void RunManyAsync(std::vector<const BoardFeatures*>&& features,
+                    std::vector<Output*>&& outputs,
+                    Continuation continuation) override {
     int batch_size = static_cast<int>(features.size());
     auto* input_tensor = interpreter_->tensor(interpreter_->inputs()[0]);
     MG_CHECK(input_tensor->dims->data[0] == batch_size);
@@ -111,11 +111,7 @@ class LiteDualNet : public DualNet {
       outputs[i]->value = value_data[i];
     }
 
-    if (model != nullptr) {
-      *model = graph_path_;
-    }
-
-    task();
+    continuation(model_path_);
   }
 
  private:
@@ -124,14 +120,11 @@ class LiteDualNet : public DualNet {
 
   int policy_;
   int value_;
-
-  std::string graph_path_;
 };
 
 }  // namespace
 
-std::unique_ptr<DualNet> LiteDualNetFactory::New() {
-  return absl::make_unique<LiteDualNet>(model());
+std::unique_ptr<DualNet> NewLiteDualNet(const std::string& model_path) {
+  return absl::make_unique<LiteDualNet>(model_path);
 }
-
 }  // namespace minigo

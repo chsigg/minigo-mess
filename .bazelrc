@@ -1,2 +1,1 @@
-build --define=remote=1 --define=tf=1
-
+build --define=remote=1 --define=tf=1 --define=trt=1 --define=board_size=9

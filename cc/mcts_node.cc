@@ -63,8 +63,8 @@ std::string MctsNode::Describe() const {
 
   std::ostringstream oss;
   oss << std::fixed;
-  oss << setprecision(4) << Q() << "\n";
-  oss << MostVisitedPathString() << "\n";
+  oss << "Q: " << setprecision(4) << Q() << "\n";
+  oss << "Most visited: " << MostVisitedPathString() << "\n";
   oss << "move : action    Q     U     P   P-Dir    N  soft-N  p-delta  "
          "p-rel";
 
@@ -161,7 +161,7 @@ void MctsNode::InjectNoise(const std::array<float, kNumMoves>& noise) {
 MctsNode* MctsNode::SelectLeaf() {
   auto* node = this;
   for (;;) {
-    ++node->stats->N;
+    node->stats->N += 1;
 
     // If a node has never been evaluated, we have no basis to select a child.
     if (!node->is_expanded) {
@@ -305,4 +305,5 @@ MctsNode* MctsNode::MaybeAddChild(Coord c) {
     return it->second.get();
   }
 }
+
 }  // namespace minigo

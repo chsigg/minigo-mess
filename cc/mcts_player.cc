@@ -36,7 +36,7 @@ std::ostream& operator<<(std::ostream& os, const MctsPlayer::Options& options) {
      << " soft_pick:" << options.soft_pick
      << " random_symmetry:" << options.random_symmetry
      << " resign_threshold:" << options.resign_threshold
-     << " batch_size:" << options.batch_size << " komi:" << options.komi
+     << " virtual_losses:" << options.virtual_losses << " komi:" << options.komi
      << " num_readouts:" << options.num_readouts
      << " seconds_per_move:" << options.seconds_per_move
      << " time_limit:" << options.time_limit
@@ -70,8 +70,8 @@ float TimeRecommendation(int move_num, float seconds_per_move, float time_limit,
          std::pow(decay_factor, std::max(player_move_num - core_moves, 0));
 }
 
-MctsPlayer::MctsPlayer(std::unique_ptr<DualNet> network, const Options& options)
-    : network_(std::move(network)),
+MctsPlayer::MctsPlayer(DualNet::Client* network, const Options& options)
+    : network_(network),
       game_root_(&dummy_stats_, {&bv_, &gv_, Color::kBlack}),
       rnd_(options.random_seed),
       options_(options) {
@@ -112,56 +112,12 @@ void MctsPlayer::NewGame() {
 }
 
 Coord MctsPlayer::SuggestMove() {
-  auto start = absl::Now();
-
-  std::array<float, kNumMoves> noise;
-  if (options_.inject_noise) {
-    // In order to be able to inject noise into the root node, we need to first
-    // expand it. The root will always be expanded unless this is the first time
-    // SuggestMove has been called for a game.
-    if (!root_->is_expanded) {
-      auto* first_node = root_->SelectLeaf();
-      ProcessLeaves({&first_node, 1});
-    }
-
-    rnd_.Dirichlet(kDirichletAlpha, &noise);
-    root_->InjectNoise(noise);
-  }
-  int current_readouts = root_->N();
-
-  if (options_.seconds_per_move > 0) {
-    // Use time to limit the number of reads.
-    float seconds_per_move = options_.seconds_per_move;
-    if (options_.time_limit > 0) {
-      seconds_per_move =
-          TimeRecommendation(root_->position.n(), seconds_per_move,
-                             options_.time_limit, options_.decay_factor);
-    }
-    while (absl::Now() - start < absl::Seconds(seconds_per_move)) {
-      TreeSearch(options_.batch_size);
-    }
-  } else {
-    // Use a fixed number of reads.
-    while (root_->N() < current_readouts + options_.num_readouts) {
-      TreeSearch(options_.batch_size);
+  AsyncStepper stepper(this);
+  for (;;) {
+    if (auto move_opt = stepper.TryGet()) {
+      return move_opt.value();
     }
   }
-  int num_readouts = root_->N() - current_readouts;
-  auto elapsed = absl::Now() - start;
-  elapsed = elapsed * 100 / num_readouts;
-  if (options_.verbose) {
-    std::cerr << "Milliseconds per 100 reads: "
-              << absl::ToInt64Milliseconds(elapsed) << "ms"
-              << " over " << num_readouts
-              << " readouts (batched: " << options_.batch_size << ")"
-              << std::endl;
-  }
-
-  if (ShouldResign()) {
-    return Coord::kResign;
-  }
-
-  return PickMove();
 }
 
 Coord MctsPlayer::PickMove() {
@@ -195,10 +151,11 @@ Coord MctsPlayer::PickMove() {
   return c;
 }
 
-absl::Span<MctsNode* const> MctsPlayer::TreeSearch(int batch_size) {
-  int max_iterations = batch_size * 2;
+std::future<std::vector<MctsNode*>> MctsPlayer::TreeSearch(int virtual_losses) {
+  int max_iterations = virtual_losses * 2;
 
-  leaves_.clear();
+  std::vector<MctsNode*> leaves;
+  leaves.reserve(virtual_losses);
   for (int i = 0; i < max_iterations; ++i) {
     auto* leaf = root_->SelectLeaf();
     if (leaf == nullptr) {
@@ -210,21 +167,36 @@ absl::Span<MctsNode* const> MctsPlayer::TreeSearch(int batch_size) {
       leaf->IncorporateEndGameResult(value, root_);
     } else {
       leaf->AddVirtualLoss(root_);
-      leaves_.push_back(leaf);
-      if (static_cast<int>(leaves_.size()) == batch_size) {
+      leaves.push_back(leaf);
+      if (static_cast<int>(leaves.size()) == virtual_losses) {
         break;
       }
     }
   }
 
-  if (!leaves_.empty()) {
-    ProcessLeaves(absl::MakeSpan(leaves_));
-    for (auto* leaf : leaves_) {
-      leaf->RevertVirtualLoss(root_);
-    }
+  if (leaves.empty()) {
+    return std::async(std::launch::deferred,
+                      [] { return std::vector<MctsNode*>(); });
   }
 
-  return absl::MakeConstSpan(leaves_);
+  auto future = ProcessLeaves(leaves);
+  return std::async(
+      std::launch::deferred,
+      [this](std::future<void> future, std::vector<MctsNode*>&& leaves) {
+        future.wait();
+        for (auto* leaf : leaves) {
+          leaf->RevertVirtualLoss(root_);
+        }
+        return leaves;
+      },
+      std::move(future), std::move(leaves));
+}
+
+std::future<void> MctsPlayer::TreeSearch() {
+  return std::async(
+      std::launch::deferred,
+      [](std::future<std::vector<MctsNode*>> future) { future.wait(); },
+      TreeSearch(options_.virtual_losses));
 }
 
 bool MctsPlayer::ShouldResign() const {
@@ -302,7 +274,7 @@ void MctsPlayer::PushHistory(Coord c) {
       models.push_back(it->model);
     }
     std::reverse(models.begin(), models.end());
-    auto model_comment = absl::StrCat("models:", absl::StrJoin(models, ","));
+    auto model_comment = absl::StrCat("models: ", absl::StrJoin(models, ","));
     history.comment = absl::StrCat(model_comment, "\n", history.comment);
     if (options_.verbose) {
       std::cerr << model_comment << std::endl;
@@ -333,7 +305,8 @@ void MctsPlayer::PushHistory(Coord c) {
   }
 }
 
-void MctsPlayer::ProcessLeaves(absl::Span<MctsNode*> leaves) {
+std::future<void> MctsPlayer::ProcessLeaves(
+    const std::vector<MctsNode*>& leaves) {
   // Select symmetry operations to apply.
   symmetries_used_.clear();
   if (options_.random_symmetry) {
@@ -349,41 +322,119 @@ void MctsPlayer::ProcessLeaves(absl::Span<MctsNode*> leaves) {
   // Build input features for each leaf, applying random symmetries if
   // requested.
   DualNet::BoardFeatures raw_features;
-  features_.resize(leaves.size());
+  std::vector<DualNet::BoardFeatures> features(leaves.size());
   for (size_t i = 0; i < leaves.size(); ++i) {
     leaves[i]->GetMoveHistory(DualNet::kMoveHistory, &recent_positions_);
-    DualNet::SetFeatures(recent_positions_, leaves[i]->position.to_play(),
-                         &raw_features);
+    DualNet::SetFeatures(absl::MakeConstSpan(recent_positions_),
+                         leaves[i]->position.to_play(), &raw_features);
     symmetry::ApplySymmetry<float, kN, DualNet::kNumStoneFeatures>(
-        symmetries_used_[i], raw_features.data(), features_[i].data());
+        symmetries_used_[i], raw_features.data(), features[i].data());
   }
 
-  // Run inference.
-  outputs_.resize(leaves.size());
-  network_->RunMany(absl::MakeSpan(features_), absl::MakeSpan(outputs_),
-                    &model_);
+  return std::async(
+      std::launch::deferred,
+      [this, leaves](std::future<DualNet::Result>&& future) {
+        auto result = std::move(future.get());
 
-  // Record some information about the inference.
-  if (!model_.empty()) {
-    if (inferences_.empty() || model_ != inferences_.back().model) {
-      inferences_.emplace_back(model_, root_->position.n());
-    }
-    inferences_.back().last_move = root_->position.n();
-    inferences_.back().total_count += leaves.size();
+        // Record some information about the inference.
+        if (!result.model.empty()) {
+          if (inferences_.empty() || result.model != inferences_.back().model) {
+            inferences_.emplace_back(result.model, root_->position.n());
+          }
+          inferences_.back().last_move = root_->position.n();
+          inferences_.back().total_count += leaves.size();
+        }
+
+        // Incorporate the inference outputs back into tree search, undoing any
+        // previously applied random symmetries.
+        std::array<float, kNumMoves> raw_policy;
+        for (size_t i = 0; i < leaves.size(); ++i) {
+          MctsNode* leaf = leaves[i];
+          const auto& output = result.outputs[i];
+          symmetry::ApplySymmetry<float, kN, 1>(
+              symmetry::Inverse(symmetries_used_[i]), output.policy.data(),
+              raw_policy.data());
+          raw_policy[Coord::kPass] = output.policy[Coord::kPass];
+          leaf->IncorporateResults(absl::MakeConstSpan(raw_policy),
+                                   output.value, root_);
+        }
+      },
+      network_->RunManyAsync(std::move(features)));
+}
+
+void MctsPlayer::MaybeApplyNoise() {
+  if (!options_.inject_noise) {
+    return;
+  }
+  std::array<float, kNumMoves> noise;
+  rnd_.Dirichlet(kDirichletAlpha, &noise);
+  root_->InjectNoise(noise);
+}
+
+MctsPlayer::AsyncStepper::AsyncStepper(MctsPlayer* player)
+    : player_(player),
+      start_time_(absl::Now()),
+      start_readouts_(static_cast<int>(player_->root_->N())),
+      time_limit_([&] {
+        const auto& options = player_->options();
+        float seconds_per_move = options.seconds_per_move;
+        if (options.time_limit > 0) {
+          seconds_per_move =
+              TimeRecommendation(player_->root_->position.n(), seconds_per_move,
+                                 options.time_limit, options.decay_factor);
+        }
+        return absl::Seconds(seconds_per_move);
+      }()),
+      future_([&] {
+        if (player_->root_->is_expanded) {
+          player_->MaybeApplyNoise();
+          return player_->TreeSearch();
+        }
+
+        // We need to expand the first node. This will happen on the first call
+        // to SuggestMove only.
+        ++start_readouts_;
+        MctsNode* first_node = player_->root_->SelectLeaf();
+        return std::async(std::launch::deferred,
+                          [=](std::future<void> future) {
+                            future.wait();
+                            player_->MaybeApplyNoise();
+                          },
+                          player_->ProcessLeaves({first_node}));
+      }()) {}
+
+absl::optional<Coord> MctsPlayer::AsyncStepper::TryGet() {
+  future_.wait();
+
+  const auto& options = player_->options();
+  if ([&] {
+        if (options.seconds_per_move == 0) {
+          // Use a fixed number of reads.
+          return player_->root_->N() < start_readouts_ + options.num_readouts;
+        }
+        // Use time to limit the number of reads.
+        return absl::Now() - start_time_ < time_limit_;
+      }()) {
+    future_ = player_->TreeSearch();
+    return absl::nullopt;
   }
 
-  // Incorporate the inference outputs back into tree search, undoing any
-  // previously applied random symmetries.
-  std::array<float, kNumMoves> raw_policy;
-  for (size_t i = 0; i < leaves.size(); ++i) {
-    MctsNode* leaf = leaves[i];
-    const auto& output = outputs_[i];
-    symmetry::ApplySymmetry<float, kN, 1>(
-        symmetry::Inverse(symmetries_used_[i]), output.policy.data(),
-        raw_policy.data());
-    raw_policy[Coord::kPass] = output.policy[Coord::kPass];
-    leaf->IncorporateResults(raw_policy, output.value, root_);
+  if (options.verbose) {
+    int num_readouts = player_->root_->N() - start_readouts_;
+    auto elapsed = absl::Now() - start_time_;
+    elapsed = elapsed * 100 / num_readouts;
+    std::cerr << "Milliseconds per 100 reads: "
+              << absl::ToInt64Milliseconds(elapsed) << "ms"
+              << " over " << num_readouts
+              << " readouts (virtual losses: " << options.virtual_losses << ")"
+              << std::endl;
   }
+
+  if (player_->ShouldResign()) {
+    return Coord(Coord::kResign);
+  }
+
+  return player_->PickMove();
 }
 
 }  // namespace minigo

@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <stdio.h>
 #include <unistd.h>
+#include <cstdio>
 #include <cstring>
 #include <iostream>
 #include <memory>
@@ -115,6 +115,7 @@ DEFINE_int32(parallel_games, 32,
              "parallel_games should equal games_per_inference * 2 because this "
              "allows the transfer of inference requests & responses to be "
              "overlapped with model evaluation.");
+DEFINE_int32(game_threads, 16, "Number of threads that play games.");
 
 // Output flags.
 DEFINE_string(output_dir, "",
@@ -164,14 +165,14 @@ void WriteExample(const std::string& output_dir, const std::string& output_name,
   std::vector<const Position::Stones*> recent_positions;
   for (const auto& h : player.history()) {
     h.node->GetMoveHistory(DualNet::kMoveHistory, &recent_positions);
-    DualNet::SetFeatures(recent_positions, h.node->position.to_play(),
-                         &features);
+    DualNet::SetFeatures(absl::MakeConstSpan(recent_positions),
+                         h.node->position.to_play(), &features);
     examples.push_back(
         tf_utils::MakeTfExample(features, h.search_pi, player.result()));
   }
 
   auto output_path = file::JoinPath(output_dir, output_name + ".tfrecord.zz");
-  tf_utils::WriteTfExamples(output_path, examples);
+  tf_utils::WriteTfExamples(output_path, absl::MakeConstSpan(examples));
 }
 
 void WriteSgf(const std::string& output_dir, const std::string& output_name,
@@ -208,13 +209,14 @@ void WriteSgf(const std::string& output_dir, const std::string& output_name,
     }
   }
 
-  std::string player_name(file::Basename(FLAGS_model));
+  std::string player_name =
+      static_cast<std::string>(file::Basename(FLAGS_model));
   sgf::CreateSgfOptions options;
   options.komi = player_b.options().komi;
   options.result = player_b.result_string();
   options.black_name = player_b.name();
   options.white_name = player_w.name();
-  auto sgf_str = sgf::CreateSgfString(moves, options);
+  auto sgf_str = sgf::CreateSgfString(absl::MakeConstSpan(moves), options);
 
   auto output_path = file::JoinPath(output_dir, output_name + ".sgf");
   TF_CHECK_OK(tf_utils::WriteFile(output_path, sgf_str));
@@ -230,7 +232,7 @@ void ParseMctsPlayerOptionsFromFlags(MctsPlayer::Options* options) {
   options->soft_pick = FLAGS_soft_pick;
   options->random_symmetry = FLAGS_random_symmetry;
   options->resign_threshold = FLAGS_resign_threshold;
-  options->batch_size = FLAGS_virtual_losses;
+  options->virtual_losses = FLAGS_virtual_losses;
   options->komi = FLAGS_komi;
   options->random_seed = FLAGS_seed;
   options->num_readouts = FLAGS_num_readouts;
@@ -242,16 +244,22 @@ void ParseMctsPlayerOptionsFromFlags(MctsPlayer::Options* options) {
 class SelfPlayer {
  public:
   void Run() {
-    {
-      absl::MutexLock lock(&mutex_);
-      dual_net_factory_ = NewDualNetFactory(FLAGS_model, FLAGS_parallel_games);
-    }
-    for (int i = 0; i < FLAGS_parallel_games; ++i) {
-      threads_.emplace_back(std::bind(&SelfPlayer::ThreadRun, this, i));
+    auto start_time = absl::Now();
+    network_ = NewDualNetService(FLAGS_model);
+    int games_per_thread =
+        (FLAGS_parallel_games + FLAGS_game_threads - 1) / FLAGS_game_threads;
+    for (int i = FLAGS_parallel_games, thread_id = 0; i > 0; ++thread_id) {
+      int num_games = std::min(i, games_per_thread);
+      threads_.emplace_back(
+          std::bind(&SelfPlayer::ThreadRun, this, thread_id, num_games));
+      i -= num_games;
     }
     for (auto& t : threads_) {
       t.join();
     }
+    std::cerr << "All threads stopped, total time "
+              << absl::ToDoubleSeconds(absl::Now() - start_time) << " sec."
+              << std::endl;
   }
 
  private:
@@ -260,20 +268,20 @@ class SelfPlayer {
   // held. This allows us to safely update the command line arguments from a
   // flag file without causing any race conditions.
   struct GameOptions {
-    void Init(int thread_id) {
+    void Init() {
       ParseMctsPlayerOptionsFromFlags(&player_options);
-      player_options.verbose = false;  // TODO(csigg): revert to thread_id == 0;
-      // If an random seed was explicitly specified, make sure we use a
-      // different seed for each thread.
-      if (player_options.random_seed != 0) {
-        player_options.random_seed += 1299283 * thread_id;
-      }
 
       run_forever = FLAGS_run_forever;
       holdout_pct = FLAGS_holdout_pct;
       output_dir = FLAGS_output_dir;
       holdout_dir = FLAGS_holdout_dir;
       sgf_dir = FLAGS_sgf_dir;
+    }
+
+    void IncrementSeed(size_t increment) {
+      if (player_options.random_seed != 0) {
+        player_options.random_seed += increment;
+      }
     }
 
     MctsPlayer::Options player_options;
@@ -284,7 +292,7 @@ class SelfPlayer {
     std::string sgf_dir;
   };
 
-  void ThreadRun(int thread_id) {
+  void ThreadRun(int thread_id, size_t num_games) {
     pthread_setname_np(pthread_self(), "Player");
 
     // Only print the board using ANSI colors if stderr is sent to the
@@ -293,8 +301,6 @@ class SelfPlayer {
 
     GameOptions game_options;
     do {
-      std::unique_ptr<MctsPlayer> player;
-
       {
         absl::MutexLock lock(&mutex_);
         auto old_model = FLAGS_model;
@@ -303,51 +309,97 @@ class SelfPlayer {
             << "Manually changing the model during selfplay is not supported. "
                "Use --checkpoint_dir and --engine=remote to perform inference "
                "using the most recent checkpoint from training.";
-        game_options.Init(thread_id);
-        player = absl::make_unique<MctsPlayer>(dual_net_factory_->New(),
-                                               game_options.player_options);
+        game_options.Init();
+      }
+
+      auto client = absl::make_unique<DualNet::Client>(network_.get());
+
+      // Create players. If an random seed was explicitly specified, offset it
+      // with a different value for each player.
+      game_options.IncrementSeed(1299283 * thread_id);
+      std::vector<std::unique_ptr<MctsPlayer>> players;
+      players.reserve(num_games);
+      for (size_t i = 0; i < num_games; ++i) {
+        game_options.player_options.verbose = false;  //! i && !thread_id;
+        players.push_back(absl::make_unique<MctsPlayer>(
+            client.get(), game_options.player_options));
+        game_options.IncrementSeed(9491);
       }
 
       // Play the game.
       auto start_time = absl::Now();
-      while (!player->game_over()) {
-        auto move = player->SuggestMove();
-        if (player->options().verbose) {
-          std::cerr << player->root()->position.ToPrettyString(use_ansi_colors);
-          std::cerr << player->root()->Describe() << std::endl;
+      size_t num_moves = 0;
+      while (!players.empty()) {
+        std::vector<std::unique_ptr<MctsPlayer::AsyncStepper>> steppers;
+        steppers.reserve(players.size());
+        for (const auto& player : players) {
+          steppers.push_back(
+              absl::make_unique<MctsPlayer::AsyncStepper>(player.get()));
         }
-        player->PlayMove(move);
-      }
-      std::cerr << player->result_string() << std::endl;
-      std::cout << "Playing game: "
-                << absl::ToDoubleSeconds(absl::Now() - start_time) << std::endl;
 
-      // Write the outputs.
-      auto now = absl::Now();
-      auto output_name = GetOutputName(now, thread_id);
+        do {
+          client->Flush();
+          steppers.erase(
+              std::remove_if(
+                  steppers.begin(), steppers.end(),
+                  [&](const std::unique_ptr<MctsPlayer::AsyncStepper>&
+                          stepper) {
+                    if (auto move_opt = stepper->TryGet()) {
+                      auto* player = stepper->player();
+                      if (player->options().verbose) {
+                        std::cerr << player->root()->position.ToPrettyString(
+                            use_ansi_colors);
+                        std::cerr << player->root()->Describe() << std::endl;
+                      }
+                      player->PlayMove(move_opt.value());
+                      return true;
+                    }
+                    return false;
+                  }),
+              steppers.end());
+        } while (!steppers.empty());
 
-      bool is_holdout;
-      {
-        absl::MutexLock lock(&mutex_);
-        is_holdout = rnd_() < game_options.holdout_pct;
-      }
-      auto example_dir =
-          is_holdout ? game_options.holdout_dir : game_options.output_dir;
-      if (!example_dir.empty()) {
-        WriteExample(GetOutputDir(now, example_dir), output_name, *player);
+        num_moves += players.size();
+        auto last =
+            std::remove_if(players.begin(), players.end(),
+                           [](const std::unique_ptr<MctsPlayer>& player) {
+                             return player->game_over();
+                           });
+        for (auto it = last; it != players.end(); ++it) {
+          const auto& player = *it;
+
+          // Write the outputs.
+          auto now = absl::Now();
+          auto output_name = GetOutputName(now, thread_id);
+
+          bool is_holdout = [&] {
+            absl::MutexLock lock(&mutex_);
+            return rnd_();
+          }() < game_options.holdout_pct;
+          auto example_dir =
+              is_holdout ? game_options.holdout_dir : game_options.output_dir;
+          if (!example_dir.empty()) {
+            WriteExample(GetOutputDir(now, example_dir), output_name, *player);
+          }
+
+          if (!game_options.sgf_dir.empty()) {
+            WriteSgf(GetOutputDir(
+                         now, file::JoinPath(game_options.sgf_dir, "clean")),
+                     output_name, *player, false);
+            WriteSgf(
+                GetOutputDir(now, file::JoinPath(game_options.sgf_dir, "full")),
+                output_name, *player, true);
+          }
+        }
+        players.erase(last, players.end());
       }
 
-      if (!game_options.sgf_dir.empty()) {
-        WriteSgf(
-            GetOutputDir(now, file::JoinPath(game_options.sgf_dir, "clean")),
-            output_name, *player, false);
-        WriteSgf(
-            GetOutputDir(now, file::JoinPath(game_options.sgf_dir, "full")),
-            output_name, *player, true);
-      }
+      std::cerr << "Thread " << thread_id << " played " << num_games
+                << " games with " << num_moves << " total moves in "
+                << absl::ToDoubleSeconds(absl::Now() - start_time) << " sec."
+                << std::endl;
+
     } while (game_options.run_forever);
-
-    std::cerr << "Thread " << thread_id << " stopping" << std::endl;
   }
 
   void MaybeReloadFlags() EXCLUSIVE_LOCKS_REQUIRED(&mutex_) {
@@ -382,17 +434,15 @@ class SelfPlayer {
     }
   }
 
+  std::unique_ptr<DualNet::Service> network_;
+
   absl::Mutex mutex_;
-  std::unique_ptr<DualNetFactory> dual_net_factory_ GUARDED_BY(&mutex_);
   Random rnd_ GUARDED_BY(&mutex_);
   std::vector<std::thread> threads_;
   uint64_t flags_timestamp_ = 0;
 };
 
-void SelfPlay() {
-  SelfPlayer player;
-  player.Run();
-}
+void SelfPlay() { SelfPlayer().Run(); }
 
 void Eval() {
   MctsPlayer::Options options;
@@ -401,13 +451,15 @@ void Eval() {
   options.soft_pick = false;
   options.random_symmetry = true;
 
-  options.name = std::string(file::Stem(FLAGS_model));
-  auto black_factory = NewDualNetFactory(FLAGS_model, 1);
-  auto black = absl::make_unique<MctsPlayer>(black_factory->New(), options);
+  options.name = static_cast<std::string>(file::Stem(FLAGS_model));
+  auto black_network = NewDualNetService(FLAGS_model);
+  auto black_client = absl::make_unique<DualNet::Client>(black_network.get());
+  auto black = absl::make_unique<MctsPlayer>(black_client.get(), options);
 
-  options.name = std::string(file::Stem(FLAGS_model_two));
-  auto white_factory = NewDualNetFactory(FLAGS_model_two, 1);
-  auto white = absl::make_unique<MctsPlayer>(white_factory->New(), options);
+  options.name = static_cast<std::string>(file::Stem(FLAGS_model_two));
+  auto white_network = NewDualNetService(FLAGS_model_two);
+  auto white_client = absl::make_unique<DualNet::Client>(white_network.get());
+  auto white = absl::make_unique<MctsPlayer>(white_client.get(), options);
 
   auto* player = black.get();
   auto* other_player = white.get();
@@ -438,8 +490,9 @@ void Gtp() {
   options.name = absl::StrCat("minigo-", file::Basename(FLAGS_model));
   options.ponder_limit = FLAGS_ponder_limit;
   options.courtesy_pass = FLAGS_courtesy_pass;
-  auto dual_net_factory = NewDualNetFactory(FLAGS_model, 1);
-  auto player = absl::make_unique<GtpPlayer>(dual_net_factory->New(), options);
+  auto network = NewDualNetService(FLAGS_model);
+  auto client = absl::make_unique<DualNet::Client>(network.get());
+  auto player = absl::make_unique<GtpPlayer>(client.get(), options);
   player->Run();
 }
 

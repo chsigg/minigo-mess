@@ -29,6 +29,11 @@ config_setting(
     define_values = {"lite": "1"},
 )
 
+config_setting(
+    name = "enable_trt",
+    define_values = {"trt": "1"},
+)
+
 minigo_cc_library(
     name = "dual_net",
     srcs = ["dual_net.cc"],
@@ -37,6 +42,7 @@ minigo_cc_library(
         "//cc:base",
         "//cc:position",
         "@com_google_absl//absl/types:span",
+        "@com_github_gflags_gflags//:gflags",
     ],
 )
 
@@ -49,16 +55,22 @@ factory_engine_copts = select({
 }) + select({
     ":enable_lite": ["-DMG_ENABLE_LITE_DUAL_NET"],
     "//conditions:default": [],
+}) + select({
+    ":enable_trt": ["-DMG_ENABLE_TRT_DUAL_NET"],
+    "//conditions:default": [],
 })
 
 factory_engine_deps = select({
-    ":enable_remote": [":inference_server"],
+    ":enable_remote": [":remote_dual_net"],
     "//conditions:default": [],
 }) + select({
     ":enable_tf": [":tf_dual_net"],
     "//conditions:default": [],
 }) + select({
     ":enable_lite": [":lite_dual_net"],
+    "//conditions:default": [],
+}) + select({
+    ":enable_trt": [":trt_dual_net"],
     "//conditions:default": [],
 })
 
@@ -69,6 +81,7 @@ minigo_cc_library(
     copts = factory_engine_copts,
     deps = [
         ":dual_net",
+        ":batching_dual_net",
         "//cc:base",
         "//cc:check",
         "@com_github_gflags_gflags//:gflags",
@@ -80,8 +93,8 @@ minigo_cc_library(
 minigo_cc_library(
     name = "fake_net",
     testonly = 1,
-    srcs = ["fake_net.cc"],
-    hdrs = ["fake_net.h"],
+    srcs = ["fake_dual_net.cc"],
+    hdrs = ["fake_dual_net.h"],
     deps = [
         ":dual_net",
         "//cc:base",
@@ -89,11 +102,10 @@ minigo_cc_library(
     ],
 )
 
-# TODO(tommadams): rename inference_server to remote_dual_net
 minigo_cc_library(
-    name = "inference_server",
-    srcs = ["inference_server.cc"],
-    hdrs = ["inference_server.h"],
+    name = "remote_dual_net",
+    srcs = ["remote_dual_net.cc"],
+    hdrs = ["remote_dual_net.h"],
     deps = [
         ":dual_net",
         "//cc:thread_safe_queue",
@@ -114,6 +126,7 @@ minigo_cc_library(
         "//cc:base",
         "//cc:check",
         "//cc:tensorflow",
+        "//cc:thread_safe_queue",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/types:span",
     ],
@@ -133,6 +146,35 @@ minigo_cc_library(
     ],
 )
 
+minigo_cc_library(
+    name = "trt_dual_net",
+    srcs = ["trt_dual_net.cc"],
+    hdrs = ["trt_dual_net.h"],
+    deps = [
+        ":dual_net",
+        "//cc:base",
+        "//cc:check",
+        "//cc:tensorrt",
+        "//cc:thread_safe_queue",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/types:span",
+        "@local_config_cuda//:cuda",
+    ],
+)
+
+minigo_cc_library(
+    name = "batching_dual_net",
+    srcs = ["batching_service.cc"],
+    hdrs = ["batching_service.h"],
+    deps = [
+        ":dual_net",
+        "//cc:base",
+        "//cc:check",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/types:span",
+    ],
+)
+
 minigo_cc_test_9_only(
     name = "dual_net_test",
     size = "small",
@@ -147,10 +189,10 @@ minigo_cc_test_9_only(
 
 minigo_cc_test_9_only(
     name = "inference_server_test",
-    srcs = ["inference_server_test.cc"],
+    srcs = ["remote_dual_net_test.cc"],
     deps = [
         ":fake_net",
-        ":inference_server",
+        ":remote_dual_net",
         "//cc:random",
         "//proto:inference_service_proto",
         "@com_google_absl//absl/strings",

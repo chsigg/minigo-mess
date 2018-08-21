@@ -43,21 +43,25 @@ cc_library(
         ],
         exclude = ["**/*.so"],
     ),
-    strip_include_prefix = "tensorflow",
     linkopts = ["-ldl"],
+    strip_include_prefix = "tensorflow",
 )
 
 cc_library(
     name = "tensorrt",
     srcs = [
-        "tensorrt/lib/libnvparsers.so",
         "tensorrt/lib/libnvinfer.so",
+        "tensorrt/lib/libnvinfer.so.4",
+        "tensorrt/lib/libnvinfer.so.4.1.2",
+        "tensorrt/lib/libnvparsers.so",
+        "tensorrt/lib/libnvparsers.so.4",
+        "tensorrt/lib/libnvparsers.so.4.1.2",
     ],
     hdrs = glob(
         ["tensorrt/include/*.h"],
     ),
-    strip_include_prefix = "tensorrt/include",
     include_prefix = "tensorrt",
+    strip_include_prefix = "tensorrt/include",
 )
 
 minigo_cc_library(
@@ -151,6 +155,7 @@ minigo_cc_library(
         "@com_google_absl//absl/memory",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/time",
+        "@com_google_absl//absl/types:optional",
         "@com_google_absl//absl/types:span",
     ],
 )

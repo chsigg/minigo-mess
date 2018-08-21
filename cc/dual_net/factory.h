@@ -9,8 +9,8 @@
 
 namespace minigo {
 
-std::unique_ptr<DualNetFactory> NewDualNetFactory(std::string model_path,
-                                                  int parallel_games);
+std::unique_ptr<DualNet::Service> NewDualNetService(
+    const std::string& model_path);
 
 }  // namespace minigo
 

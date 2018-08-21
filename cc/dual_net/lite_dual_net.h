@@ -19,13 +19,7 @@
 
 namespace minigo {
 
-class LiteDualNetFactory : public DualNetFactory {
- public:
-  LiteDualNetFactory(std::string model_path)
-      : DualNetFactory(std::move(model_path)) {}
-
-  std::unique_ptr<DualNet> New() override;
-};
+std::unique_ptr<DualNet> NewLiteDualNet(const std::string& model_path);
 
 }  // namespace minigo
 

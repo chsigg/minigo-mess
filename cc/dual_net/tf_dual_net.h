@@ -19,20 +19,7 @@
 
 namespace minigo {
 
-namespace internal {
-class TfService;
-}
-
-class TfDualNetFactory : public DualNetFactory {
- public:
-  TfDualNetFactory(std::string model_path);
-  ~TfDualNetFactory();
-
-  std::unique_ptr<DualNet> New() override;
-
- private:
-  std::unique_ptr<internal::TfService> service_;
-};
+std::unique_ptr<DualNet> NewTfDualNet(const std::string& model_path);
 
 }  // namespace minigo
 

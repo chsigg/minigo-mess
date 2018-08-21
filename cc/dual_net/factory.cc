@@ -3,7 +3,7 @@
 #include "absl/memory/memory.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
-#include "cc/dual_net/batching_dual_net.h"
+#include "cc/dual_net/batching_service.h"
 #include "gflags/gflags.h"
 
 #ifdef MG_ENABLE_REMOTE_DUAL_NET
@@ -56,13 +56,13 @@ namespace minigo {
 
 DualNetFactory::~DualNetFactory() = default;
 
-std::unique_ptr<DualNetFactory> NewDualNetFactory(std::string model_path,
-                                                  int parallel_games) {
-  std::unique_ptr<DualNetFactory> factory;
+std::unique_ptr<DualNet::Service> NewDualNetService(
+    const std::string& model_path) {
+  std::unique_ptr<DualNet> dual_net;
 
   if (FLAGS_engine == "remote") {
 #ifdef MG_ENABLE_REMOTE_DUAL_NET
-    factory = absl::make_unique<RemoteDualNetFactory>(std::move(model_path));
+    dual_net = NewRemoteDualNet(model_path);
 #else
     MG_FATAL() << "Binary wasn't compiled with remote inference support";
 #endif  // MG_ENABLE_REMOTE_DUAL_NET
@@ -70,7 +70,7 @@ std::unique_ptr<DualNetFactory> NewDualNetFactory(std::string model_path,
 
   if (FLAGS_engine == "tf") {
 #ifdef MG_ENABLE_TF_DUAL_NET
-    factory = absl::make_unique<TfDualNetFactory>(std::move(model_path));
+    dual_net = NewTfDualNet(model_path);
 #else
     MG_FATAL() << "Binary wasn't compiled with tf inference support";
 #endif  // MG_ENABLE_TF_DUAL_NET
@@ -78,24 +78,30 @@ std::unique_ptr<DualNetFactory> NewDualNetFactory(std::string model_path,
 
   if (FLAGS_engine == "lite") {
 #ifdef MG_ENABLE_LITE_DUAL_NET
-    factory = absl::make_unique<LiteDualNetFactory>(std::move(model_path));
+    dual_net = NewLiteDualNet(model_path);
 #else
     MG_FATAL() << "Binary wasn't compiled with lite inference support";
 #endif  // MG_ENABLE_LITE_DUAL_NET
   }
 
-  if (!factory) {
+  if (FLAGS_engine == "trt") {
+#ifdef MG_ENABLE_TRT_DUAL_NET
+    dual_net = NewTrtDualNet(model_path);
+#else
+    MG_FATAL() << "Binary wasn't compiled with TensorRT inference support";
+#endif  // MG_ENABLE_TRT_DUAL_NET
+  }
+
+  if (!dual_net) {
     MG_FATAL() << "Unrecognized inference engine \"" << FLAGS_engine << "\"";
   }
 
   if (FLAGS_batch_size > 0) {
-    // Batching was requested, apply batching adaptor to factory.
-    auto parent = std::move(factory);
-    auto* new_factory = new BatchingDualNetFactory(std::move(parent));
-    factory.reset(new_factory);
+    // Batching was requested, return BatchingService.
+    return NewBatchingService(std::move(dual_net));
   }
 
-  return factory;
+  return absl::make_unique<DualNet::Service>(std::move(dual_net));
 }
 
 }  // namespace minigo

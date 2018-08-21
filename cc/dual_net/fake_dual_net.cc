@@ -18,38 +18,19 @@
 #include "cc/check.h"
 
 namespace minigo {
-namespace {
-class FakeDualNet : public DualNet {
- public:
-  FakeDualNet(absl::Span<const float> priors, float value) : value_(value) {
-    MG_CHECK(priors.empty() || priors.size() == kNumMoves);
-    if (priors.empty()) {
-      priors_.resize(kNumMoves, 1.0 / kNumMoves);
-    } else {
-      priors_.assign(priors.begin(), priors.end());
-    }
+FakeDualNet::FakeDualNet()
+    : FakeDualNet(std::vector<float>(kNumMoves, 1.0f / kNumMoves), 0.0f) {}
+
+FakeDualNet::FakeDualNet(std::vector<float> priors, float value)
+    : DualNet(""), priors_(std::move(priors)), value_(value) {}
+
+void FakeDualNet::RunManyAsync(std::vector<const BoardFeatures*>&& features,
+                               std::vector<Output*>&& outputs,
+                               Continuation continuation) {
+  for (auto* output : outputs) {
+    std::copy(priors_.begin(), priors_.end(), output->policy.begin());
+    output->value = value_;
   }
-
-  void RunMany(Task&& task, absl::Span<const BoardFeatures*> features,
-               absl::Span<Output*> outputs, std::string* model) override {
-    for (auto* output : outputs) {
-      std::copy(priors_.begin(), priors_.end(), output->policy.begin());
-      output->value = value_;
-    }
-    if (model != nullptr) {
-      *model = "FakeNet";
-    }
-    task();
-  }
-
- private:
-  std::vector<float> priors_;
-  float value_;
-};
-}  // namespace
-
-std::unique_ptr<DualNet> FakeDualNetFactory::New() {
-  return absl::make_unique<FakeDualNet>(absl::MakeSpan(priors_), value_);
+  continuation(model_path_);
 }
-
 }  // namespace minigo

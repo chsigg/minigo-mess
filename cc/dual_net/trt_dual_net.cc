@@ -14,6 +14,8 @@
 
 #include "cc/dual_net/trt_dual_net.h"
 
+#include <fstream>
+
 #include "absl/memory/memory.h"
 #include "absl/strings/str_cat.h"
 #include "absl/types/span.h"
@@ -53,10 +55,8 @@ class TrtWorker {
     context_->destroy();
   }
 
-  void RunMany(absl::Span<const DualNet::BoardFeatures*> features,
-               absl::Span<DualNet::Output*> outputs) {
-    MG_DCHECK(features.size() == outputs.size());
-
+  void RunMany(const std::vector<const DualNet::BoardFeatures*>& features,
+               const std::vector<DualNet::Output*>& outputs) {
     // Copy the features into the input tensor.
     auto* feature_data = pos_tensor_;
     for (const auto* feature : features) {
@@ -104,19 +104,31 @@ class Logger : public nvinfer1::ILogger {
     }
   }
 };
-}  // namespace
 
-namespace internal {
-class TrtService {
+class TrtDualNet : public DualNet {
   struct InferenceData {
-    DualNet::Task task;
-    absl::Span<const DualNet::BoardFeatures*> features;
-    absl::Span<DualNet::Output*> outputs;
-    std::string* model;
+    std::vector<const BoardFeatures*> features;
+    std::vector<Output*> outputs;
+    Continuation continuation;
   };
 
  public:
-  TrtService(std::string model_path) : running_(true) {
+  explicit TrtDualNet(std::string model_path)
+      : DualNet(model_path), running_(true) {
+    auto functor =
+        [this, model_path](const std::pair<int, nvinfer1::ICudaEngine*>& pair) {
+          pthread_setname_np(pthread_self(), "TrtWorker");
+          cudaSetDevice(pair.first);
+          TrtWorker worker(pair.second);
+          while (running_) {
+            InferenceData inference;
+            if (queue_.PopWithTimeout(&inference, absl::Seconds(1))) {
+              worker.RunMany(inference.features, inference.outputs);
+              inference.continuation(model_path_);
+            }
+          }
+        };
+
     runtime_ = nvinfer1::createInferRuntime(logger_);
     MG_CHECK(runtime_);
 
@@ -132,11 +144,15 @@ class TrtService {
     auto* builder = nvinfer1::createInferBuilder(logger_);
     auto* network = builder->createNetwork();
 
+    if (!std::ifstream(model_path).good()) {
+      model_path = absl::StrCat(model_path, ".uff");
+    }
+
     MG_CHECK(parser->parse(model_path.c_str(), *network,
                            nvinfer1::DataType::kFLOAT));
 
     builder->setMaxBatchSize(FLAGS_batch_size);
-    builder->setMaxWorkspaceSize(1 << 30);
+    builder->setMaxWorkspaceSize(1ull << 30);
 
     cudaSetDevice(0);
     auto* engine = builder->buildCudaEngine(*network);
@@ -147,7 +163,8 @@ class TrtService {
     parser->destroy();
 
     std::vector<std::future<std::pair<int, nvinfer1::ICudaEngine*>>> futures;
-    futures.emplace_back(std::async([&] { return std::make_pair(0, engine); }));
+    futures.emplace_back(std::async(std::launch::deferred,
+                                    [&] { return std::make_pair(0, engine); }));
 
     auto* blob = engine->serialize();
     MG_CHECK(blob);
@@ -155,32 +172,15 @@ class TrtService {
     for (int device_id = 1; device_id < FLAGS_num_gpus; ++device_id) {
       futures.emplace_back(std::async(std::launch::async, [&, device_id]() {
         cudaSetDevice(device_id);
-        auto* engine = runtime_->deserializeCudaEngine(blob->data(),
-                                                       blob->size(), nullptr);
-        MG_CHECK(engine);
-        return std::make_pair(device_id, engine);
+        return std::make_pair(
+            device_id, runtime_->deserializeCudaEngine(blob->data(),
+                                                       blob->size(), nullptr));
       }));
     }
 
-    auto functor =
-        [this, model_path](const std::pair<int, nvinfer1::ICudaEngine*>& pair) {
-          pthread_setname_np(pthread_self(), "TrtWorker");
-          cudaSetDevice(pair.first);
-          TrtWorker worker(pair.second);
-          while (running_) {
-            InferenceData inference;
-            if (queue_.PopWithTimeout(&inference, absl::Seconds(1))) {
-              worker.RunMany(inference.features, inference.outputs);
-              if (inference.model) {
-                *inference.model = model_path;
-              }
-              inference.task();
-            }
-          }
-        };
-
     for (auto& future : futures) {
       auto pair = future.get();
+      MG_CHECK(pair.second) << "Failed to deserialize TensorRT engine.";
       engines_.push_back(pair.second);
       worker_threads_.emplace_back(functor, pair);
       worker_threads_.emplace_back(functor, pair);
@@ -188,7 +188,7 @@ class TrtService {
     blob->destroy();
   }
 
-  ~TrtService() {
+  ~TrtDualNet() override {
     running_ = false;
     for (auto& thread : worker_threads_) {
       thread.join();
@@ -199,10 +199,11 @@ class TrtService {
     runtime_->destroy();
   }
 
-  void RunMany(DualNet::Task&& task,
-               absl::Span<const DualNet::BoardFeatures*> features,
-               absl::Span<DualNet::Output*> outputs, std::string* model) {
-    queue_.Push({std::move(task), features, outputs, model});
+  void RunManyAsync(std::vector<const BoardFeatures*>&& features,
+                    std::vector<Output*>&& outputs,
+                    Continuation continuation) override {
+    queue_.Push(
+        {std::move(features), std::move(outputs), std::move(continuation)});
   }
 
  private:
@@ -214,32 +215,11 @@ class TrtService {
   std::vector<std::thread> worker_threads_;
   std::atomic<bool> running_;
 };
-}  // namespace internal
-
-namespace {
-class TrtDualNet : public DualNet {
- public:
-  explicit TrtDualNet(internal::TrtService* service) : service_(service) {}
-
-  void RunMany(DualNet::Task&& task, absl::Span<const BoardFeatures*> features,
-               absl::Span<Output*> outputs, std::string* model) override {
-    service_->RunMany(std::move(task), features, outputs, model);
-  }
-
- private:
-  internal::TrtService* service_;
-};
 
 }  // namespace
 
-TrtDualNetFactory::TrtDualNetFactory(std::string model_path)
-    : DualNetFactory(model_path),
-      service_(new internal::TrtService(model_path)) {}
-
-TrtDualNetFactory::~TrtDualNetFactory() = default;
-
-std::unique_ptr<DualNet> TrtDualNetFactory::New() {
-  return absl::make_unique<TrtDualNet>(service_.get());
+std::unique_ptr<DualNet> NewTrtDualNet(const std::string& model_path) {
+  return absl::make_unique<TrtDualNet>(model_path);
 }
 
 }  // namespace minigo

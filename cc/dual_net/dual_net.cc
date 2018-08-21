@@ -28,6 +28,67 @@ namespace minigo {
 constexpr int DualNet::kNumStoneFeatures;
 constexpr int DualNet::kNumBoardFeatures;
 
+DualNet::Service::Service(std::unique_ptr<DualNet> dual_net)
+    : dual_net_(std::move(dual_net)) {}
+
+DualNet::Service::~Service() = default;
+
+void DualNet::Service::IncrementClientCount() {}
+
+void DualNet::Service::DecrementClientCount() {}
+
+void DualNet::Service::FlushClient() {}
+
+std::future<DualNet::Result> DualNet::Service::RunManyAsync(
+    std::vector<BoardFeatures>&& features) {
+  std::vector<const BoardFeatures*> feature_ptrs;
+  feature_ptrs.reserve(features.size());
+  CopyPointers(features.begin(), features.size(),
+               std::back_inserter(feature_ptrs));
+
+  Functor functor(std::move(features));
+
+  std::vector<Output*> output_ptrs;
+  output_ptrs.reserve(feature_ptrs.size());
+  CopyPointers(functor.outputs.begin(), feature_ptrs.size(),
+               std::back_inserter(output_ptrs));
+
+  auto future = functor.promise.get_future();
+  dual_net_->RunManyAsync(std::move(feature_ptrs), std::move(output_ptrs),
+                          Continuation(std::move(functor)));
+  return future;
+}
+
+std::future<DualNet::Result> DualNet::Client::RunManyAsync(
+    std::vector<DualNet::BoardFeatures>&& features) {
+  return service_->RunManyAsync(std::move(features));
+}
+
+void DualNet::Client::Flush() { service_->FlushClient(); }
+
+DualNet::DualNet(const std::string& model_path) : model_path_(model_path) {}
+
+DualNet::~DualNet() = default;
+
+DualNet::Result DualNet::RunMany(std::vector<BoardFeatures>&& features) {
+  std::vector<const DualNet::BoardFeatures*> feature_ptrs;
+  feature_ptrs.reserve(features.size());
+  CopyPointers(features.begin(), features.size(),
+               std::back_inserter(feature_ptrs));
+
+  Functor functor(std::move(features));
+
+  std::vector<DualNet::Output*> output_ptrs;
+  output_ptrs.reserve(feature_ptrs.size());
+  CopyPointers(functor.outputs.begin(), feature_ptrs.size(),
+               std::back_inserter(output_ptrs));
+
+  auto future = functor.promise.get_future();
+  RunManyAsync(std::move(feature_ptrs), std::move(output_ptrs),
+               Continuation(std::move(functor)));
+  return future.get();
+}
+
 void DualNet::SetFeatures(absl::Span<const Position::Stones* const> history,
                           Color to_play, BoardFeatures* features) {
   MG_CHECK(history.size() <= kMoveHistory);
@@ -68,26 +129,6 @@ void DualNet::SetFeatures(absl::Span<const Position::Stones* const> history,
     dst[0] = to_play_feature;
     dst += kNumStoneFeatures;
   }
-}
-
-DualNet::~DualNet() = default;
-
-void DualNet::RunMany(absl::Span<const BoardFeatures> features,
-                      absl::Span<Output> outputs, std::string* model) {
-  std::vector<const DualNet::BoardFeatures*> feature_ptrs;
-  feature_ptrs.reserve(features.size());
-  std::transform(features.begin(), features.end(),
-                 std::back_inserter(feature_ptrs),
-                 std::addressof<const BoardFeatures>);
-  std::vector<DualNet::Output*> output_ptrs;
-  output_ptrs.reserve(outputs.size());
-  std::transform(outputs.begin(), outputs.end(),
-                 std::back_inserter(output_ptrs), std::addressof<Output>);
-  Task task([] {});
-  auto future = task.get_future();
-  RunMany(std::move(task), absl::MakeSpan(feature_ptrs),
-          absl::MakeSpan(output_ptrs), model);
-  future.wait();
 }
 
 }  // namespace minigo

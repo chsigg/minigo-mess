@@ -53,8 +53,8 @@ class TfWorker {
                                                 {FLAGS_batch_size, kN, kN,
                                                  DualNet::kNumStoneFeatures})));
 
-    output_names_.push_back("policy_output");
-    output_names_.push_back("value_output");
+    output_names_.emplace_back("policy_output");
+    output_names_.emplace_back("value_output");
   }
 
   ~TfWorker() {
@@ -63,10 +63,8 @@ class TfWorker {
     }
   }
 
-  void RunMany(absl::Span<const DualNet::BoardFeatures*> features,
-               absl::Span<DualNet::Output*> outputs) {
-    MG_DCHECK(features.size() == outputs.size());
-
+  void RunMany(const std::vector<const DualNet::BoardFeatures*>& features,
+               const std::vector<DualNet::Output*>& outputs) {
     // Copy the features into the input tensor.
     auto* feature_data = inputs_.front().second.flat<float>().data();
     for (const auto* feature : features) {
@@ -93,30 +91,25 @@ class TfWorker {
   std::vector<std::string> output_names_;
   std::vector<tensorflow::Tensor> outputs_;
 };
-}  // namespace
 
-namespace internal {
-class TfService {
+class TfDualNet : public DualNet {
   struct InferenceData {
-    DualNet::Task task;
-    absl::Span<const DualNet::BoardFeatures*> features;
-    absl::Span<DualNet::Output*> outputs;
-    std::string* model;
+    std::vector<const BoardFeatures*> features;
+    std::vector<Output*> outputs;
+    Continuation continuation;
   };
 
  public:
-  TfService(std::string model_path) : running_(true) {
-    auto functor = [this, model_path](const tensorflow::GraphDef& graph_def) {
+  explicit TfDualNet(std::string model_path)
+      : DualNet(model_path), running_(true) {
+    auto functor = [this](const tensorflow::GraphDef& graph_def) {
       pthread_setname_np(pthread_self(), "TfWorker");
       TfWorker worker(graph_def);
       while (running_) {
         InferenceData inference;
         if (queue_.PopWithTimeout(&inference, absl::Seconds(1))) {
           worker.RunMany(inference.features, inference.outputs);
-          if (inference.model) {
-            *inference.model = model_path;
-          }
-          inference.task();
+          inference.continuation(model_path_);
         }
       }
     };
@@ -139,17 +132,18 @@ class TfService {
     }
   }
 
-  ~TfService() {
+  ~TfDualNet() override {
     running_ = false;
     for (auto& thread : worker_threads_) {
       thread.join();
     }
   }
 
-  void RunMany(DualNet::Task&& task,
-               absl::Span<const DualNet::BoardFeatures*> features,
-               absl::Span<DualNet::Output*> outputs, std::string* model) {
-    queue_.Push({std::move(task), features, outputs, model});
+  void RunManyAsync(std::vector<const BoardFeatures*>&& features,
+                    std::vector<Output*>&& outputs,
+                    Continuation continuation) override {
+    queue_.Push(
+        {std::move(features), std::move(outputs), std::move(continuation)});
   }
 
  private:
@@ -161,11 +155,8 @@ class TfService {
               return true;
             }
             auto it = node.attr().find("dtype");
-            if (it != node.attr().end() &&
-                it->second.type() == tensorflow::DT_INT32) {
-              return false;
-            }
-            return true;
+            return it == node.attr().end() ||
+                   it->second.type() != tensorflow::DT_INT32;
           }()) {
         node.set_device(device);
       }
@@ -176,32 +167,10 @@ class TfService {
   std::vector<std::thread> worker_threads_;
   std::atomic<bool> running_;
 };
-}  // namespace internal
-
-namespace {
-class TfDualNet : public DualNet {
- public:
-  explicit TfDualNet(internal::TfService* service) : service_(service) {}
-
-  void RunMany(DualNet::Task&& task, absl::Span<const BoardFeatures*> features,
-               absl::Span<Output*> outputs, std::string* model) override {
-    service_->RunMany(std::move(task), features, outputs, model);
-  }
-
- private:
-  internal::TfService* service_;
-};
-
 }  // namespace
 
-TfDualNetFactory::TfDualNetFactory(std::string model_path)
-    : DualNetFactory(model_path),
-      service_(new internal::TfService(model_path)) {}
-
-TfDualNetFactory::~TfDualNetFactory() = default;
-
-std::unique_ptr<DualNet> TfDualNetFactory::New() {
-  return absl::make_unique<TfDualNet>(service_.get());
+std::unique_ptr<DualNet> NewTfDualNet(const std::string& model_path) {
+  return absl::make_unique<TfDualNet>(model_path);
 }
 
 }  // namespace minigo

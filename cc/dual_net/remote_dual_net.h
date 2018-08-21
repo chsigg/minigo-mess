@@ -21,22 +21,7 @@
 
 namespace minigo {
 
-namespace internal {
-class InferenceServiceImpl;
-}  // namespace internal
-
-class RemoteDualNetFactory : public DualNetFactory {
- public:
-  RemoteDualNetFactory(std::string model_path);
-  ~RemoteDualNetFactory();
-
-  // Return a new DualNet instance whose inference requests are performed
-  // by this InferenceServer.
-  std::unique_ptr<DualNet> New() override;
-
- private:
-  std::unique_ptr<internal::InferenceServiceImpl> service_;
-};
+std::unique_ptr<DualNet> NewRemoteDualNet(const std::string& model_path);
 
 }  // namespace minigo
 

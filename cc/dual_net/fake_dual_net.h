@@ -21,15 +21,14 @@
 
 namespace minigo {
 
-class FakeDualNetFactory : public DualNetFactory {
+class FakeDualNet : public DualNet {
  public:
-  FakeDualNetFactory() : FakeDualNetFactory(absl::Span<const float>(), 0) {}
-  FakeDualNetFactory(absl::Span<const float> priors, float value)
-      : DualNetFactory(""),
-        priors_(priors.begin(), priors.end()),
-        value_(value) {}
+  FakeDualNet();
+  FakeDualNet(std::vector<float> priors, float value);
 
-  std::unique_ptr<DualNet> New() override;
+  void RunManyAsync(std::vector<const BoardFeatures*>&& features,
+                    std::vector<Output*>&& outputs,
+                    Continuation continuation) override;
 
  private:
   std::vector<float> priors_;
